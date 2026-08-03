@@ -1,0 +1,62 @@
+[Unit]
+Description=Honeypath credential canary monitor
+Documentation=https://github.com/honeypath
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+#
+# Honeypath runs UNPRIVILEGED, as the user whose canaries it watches.
+#
+# It must never run as root while executing Python from a checkout that the
+# target user can write: that is a privilege-escalation path, because the user
+# -- or same-user malware -- can edit a .py file and wait for the next service
+# restart to have it run as root. Running as the target user removes the
+# escalation entirely, and the service still reaches everything it needs: that
+# user's canaries, their home, and their Windows-mounted home under WSL.
+#
+# Replace `alan` below with your target user and their primary group, and fix
+# the ExecStart paths -- or, much better, generate this file with:
+#
+#     sudo python3 honeypath.py install-systemd
+#
+User=alan
+Group=alan
+ExecStart=/usr/bin/python3 /home/alan/development/honeypath/honeypath.py --user alan --db /var/lib/honeypath/events.sqlite3 watch
+Restart=on-failure
+RestartSec=10
+
+# systemd creates /var/lib/honeypath owned by the service user before start,
+# so the database and honeypath.log live at their documented paths with no
+# root-owned directory and no manual chown.
+StateDirectory=honeypath
+StateDirectoryMode=0700
+
+# The Pushover credentials in /etc/honeypath must be readable by this
+# unprivileged service without becoming world-readable. Use either
+#     sudo chown root:alan /etc/honeypath/pushover-token /etc/honeypath/pushover-user
+#     sudo chmod 0640 /etc/honeypath/pushover-token /etc/honeypath/pushover-user
+#     sudo chmod 0750 /etc/honeypath
+# or
+#     sudo chown alan:alan /etc/honeypath/pushover-token /etc/honeypath/pushover-user
+#     sudo chmod 0600 /etc/honeypath/pushover-token /etc/honeypath/pushover-user
+
+# Hardening. Deliberately NOT set: ProtectHome / PrivateUsers /
+# ProtectSystem=strict, any of which would stop Honeypath reading the very
+# canaries it exists to watch, and ReadOnlyPaths over /mnt, which would break
+# Windows-home monitoring on WSL.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
