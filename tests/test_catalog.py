@@ -8,6 +8,7 @@ import re
 import stat
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from .support import TempHomeCase
 
@@ -65,15 +66,15 @@ class ContentSafetyTests(unittest.TestCase):
                     forbidden, lowered, f"{entry.key} mentions {forbidden}"
                 )
 
-    def test_netrc_and_npmrc_cannot_reach_a_real_server(self):
+    def test_npmrc_cannot_reach_a_real_server(self):
         npmrc = next(e for e in catalog.CATALOG if e.key == "linux.npmrc")
         # A bare `registry=` line would repoint every npm install.
         self.assertNotRegex(npmrc.content, r"(?m)^registry=")
-        netrc = next(e for e in catalog.CATALOG if e.key == "linux.netrc")
-        machines = re.findall(r"machine\s+(\S+)", netrc.content)
-        self.assertTrue(machines)
-        for machine in machines:
-            self.assertTrue(machine.endswith(".invalid"))
+
+    def test_no_entry_claims_the_netrc_path(self):
+        """git reads ~/.netrc on every HTTPS push; it cannot be a quiet canary."""
+        for entry in catalog.CATALOG:
+            self.assertNotEqual(entry.relative_path, ".netrc", entry.key)
 
     def test_my_cnf_does_not_define_a_client_group(self):
         entry = next(e for e in catalog.CATALOG if e.key == "linux.my.cnf")
@@ -144,8 +145,6 @@ class ContentSafetyTests(unittest.TestCase):
     def test_json_canaries_parse(self):
         for entry in catalog.CATALOG:
             if entry.relative_path.endswith(".json") and entry.content:
-                if entry.key.endswith("solana.keypair"):
-                    continue
                 json.loads(entry.content)  # must not raise
 
     def test_browser_entries_are_never_created(self):
@@ -209,7 +208,6 @@ class ActiveConfigAuditTests(unittest.TestCase):
             "linux.npmrc",  # scoped registry, no bare registry=
             "linux.pypirc",  # no [distutils] index-servers
             "linux.cargo.credentials",  # [registries.honeypath-canary]
-            "linux.netrc",  # machine-keyed
             "linux.pgpass",  # host-keyed
             "linux.my.cnf",  # custom option group
             "linux.docker.config",  # auths keyed by registry
@@ -284,7 +282,6 @@ class CatalogStructureTests(unittest.TestCase):
             ".pypirc",
             ".cargo/credentials.toml",
             ".config/gh/hosts.yml",
-            ".netrc",
             ".pgpass",
             ".my.cnf",
             ".dbt/profiles.yml",
@@ -523,6 +520,54 @@ class CreateCanaryFileTests(TempHomeCase):
         # The trap was never opened, so the file it points at is unchanged.
         self.assertEqual(outside.read_text(), "MUST NOT BE TOUCHED\n")
         self.assertTrue(trap.is_symlink())
+
+
+class PortableCreationTests(TempHomeCase):
+    """Hosts without O_TMPFILE (macOS) must still be able to create canaries."""
+
+    def no_unnamed_temporary(self):
+        """Pretend this host is a kernel without O_TMPFILE, e.g. Darwin."""
+        return mock.patch.object(
+            catalog.safe_write, "supports_unnamed_temporary", return_value=False
+        )
+
+    def test_new_canary_is_created_without_otmpfile(self):
+        path = self.home / ".aws" / "credentials"
+        with self.no_unnamed_temporary():
+            result = catalog.create_canary_file(path, "canary\n", 0o600, self.target)
+        self.assertTrue(result.created, result.reason)
+        self.assertEqual(path.read_text(), "canary\n")
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
+
+    def test_the_portable_path_still_never_clobbers_an_existing_file(self):
+        path = self.write(".netrc", "REAL CREDENTIALS\n")
+        with self.no_unnamed_temporary():
+            result = catalog.create_canary_file(path, "canary\n", 0o600, self.target)
+        self.assertFalse(result.created)
+        self.assertEqual(path.read_text(), "REAL CREDENTIALS\n")
+
+    def test_replacement_is_still_refused_without_the_linux_primitives(self):
+        """A managed refresh needs compare-and-swap; O_EXCL cannot provide it."""
+        path = self.write(".netrc", "old honeypath canary\n")
+        with self.no_unnamed_temporary():
+            result = catalog.create_canary_file(
+                path, "canary\n", 0o600, self.target, replace_managed=True
+            )
+        self.assertFalse(result.created)
+        self.assertEqual(path.read_text(), "old honeypath canary\n")
+
+    def test_linux_hosts_do_not_silently_relax_to_the_portable_path(self):
+        """On Linux a filesystem that cannot do O_TMPFILE is still refused."""
+        if not catalog.safe_write.supports_unnamed_temporary():  # pragma: no cover
+            self.skipTest("host has no O_TMPFILE support")
+        path = self.home / ".pypirc"
+        unavailable = catalog.safe_write.SafeWriteError("O_TMPFILE unsupported")
+        with mock.patch.object(
+            catalog.safe_write, "_open_unnamed_temporary", side_effect=unavailable
+        ):
+            result = catalog.create_canary_file(path, "canary\n", 0o600, self.target)
+        self.assertFalse(result.created)
+        self.assertFalse(path.exists())
 
 
 class CanarytokenSpliceTests(unittest.TestCase):

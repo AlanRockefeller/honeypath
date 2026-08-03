@@ -5,6 +5,10 @@ VERSION='10.4p1'
 BUILD_ROOT="$HOME/src"
 PREFIX="$HOME/.local/opt/openssh-$VERSION"
 BASE_URL='https://cdn.openbsd.org/pub/OpenBSD/OpenSSH'
+# OpenSSH release signing key (Damien Miller <djm@mindrot.org>), as published
+# with the releases and independently confirmed on public keyservers.  This is
+# the trust anchor: it must NOT be read from anything the download provides.
+RELEASE_KEY_FPR='7168B983815A5EEF59A4ADFD2A3F414E736060BA'
 SRC_DIR="$BUILD_ROOT/openssh-$VERSION"
 TARBALL="$BUILD_ROOT/openssh-$VERSION.tar.gz"
 
@@ -69,11 +73,36 @@ do_download() {
     curl -fLO "$BASE_URL/portable/openssh-$VERSION.tar.gz.asc"
     curl -fLO "$BASE_URL/RELEASE_KEY.asc"
 
-    # Verify the release signature.
-    gpg --import RELEASE_KEY.asc
-    gpg --verify \
-        "openssh-$VERSION.tar.gz.asc" \
-        "openssh-$VERSION.tar.gz"
+    # Importing whatever key came down beside the tarball and then verifying
+    # against it proves only that the two files agree — an attacker who can
+    # serve one can serve both.  Pin the fingerprint instead, and verify in a
+    # throwaway keyring so neither the user's existing trust nor any other key
+    # in the bundle can satisfy the check.
+    local keyring
+    keyring="$(mktemp -d)"
+    trap 'rm -rf "$keyring"' RETURN
+
+    if ! GNUPGHOME="$keyring" gpg --batch --quiet --import RELEASE_KEY.asc; then
+        echo "Could not import RELEASE_KEY.asc." >&2
+        exit 1
+    fi
+    if ! GNUPGHOME="$keyring" gpg --batch --with-colons --fingerprint \
+            "$RELEASE_KEY_FPR" 2>/dev/null |
+            grep -qx "fpr:::::::::$RELEASE_KEY_FPR:"; then
+        echo "ABORT: RELEASE_KEY.asc does not contain the expected OpenSSH" >&2
+        echo "release key $RELEASE_KEY_FPR." >&2
+        exit 1
+    fi
+
+    # Verify the release signature, requiring that exact key.
+    if ! GNUPGHOME="$keyring" gpg --batch --status-fd 1 --verify \
+            "openssh-$VERSION.tar.gz.asc" \
+            "openssh-$VERSION.tar.gz" |
+            grep -q "^\[GNUPG:\] VALIDSIG $RELEASE_KEY_FPR "; then
+        echo "ABORT: signature on openssh-$VERSION.tar.gz was not made by" >&2
+        echo "the pinned OpenSSH release key $RELEASE_KEY_FPR." >&2
+        exit 1
+    fi
 
     printf '\nDownloaded and verified:\n%s\n' "$TARBALL"
 }

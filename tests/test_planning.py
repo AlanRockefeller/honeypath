@@ -10,12 +10,13 @@ from unittest import mock
 
 from .support import TempHomeCase, namespace
 
-from honeypath import catalog, cli, monitor as monitor_mod  # noqa: E402
+from honeypath import (  # noqa: E402
+    catalog,
+    cli,
+    monitor as monitor_mod,
+    safe_write,
+)
 from honeypath.platform_detect import PlatformContext  # noqa: E402
-
-
-class FakePlatform(PlatformContext):
-    pass
 
 
 class PlanTests(TempHomeCase):
@@ -95,26 +96,26 @@ class PlanTests(TempHomeCase):
     # -- non-overwrite ----------------------------------------------------
 
     def test_existing_files_are_skipped_not_overwritten(self):
-        self.write(".netrc", "REAL\n")
+        self.write(".pgpass", "REAL\n")
         items, _, _ = cli.build_plan(self.make_context())
-        skipped = [i for i in items if str(i.path).endswith("/.netrc")]
+        skipped = [i for i in items if str(i.path).endswith("/.pgpass")]
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0].action, "skip")
         self.assertIn("already exists", skipped[0].reason)
 
     def test_force_can_never_plan_an_overwrite(self):
         """§2: --force must not make create-canaries replace a real file."""
-        self.write(".netrc", "REAL\n")
+        self.write(".pgpass", "REAL\n")
         items, _, _ = cli.build_plan(self.make_context(force=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("already exists", entry.reason)
 
     def test_top_level_force_can_never_plan_an_overwrite(self):
         """An inherited top-level --force must not change the outcome either."""
-        self.write(".netrc", "REAL\n")
+        self.write(".pgpass", "REAL\n")
         items, _, _ = cli.build_plan(self.make_context(top_force=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
 
     # -- active-config gating ---------------------------------------------
@@ -162,7 +163,6 @@ class PlanTests(TempHomeCase):
         items, _, _ = cli.build_plan(self.make_context())
         planned = self.paths(items, "create")
         for relative in (
-            ".netrc",
             ".npmrc",
             ".pypirc",
             ".pgpass",
@@ -176,19 +176,19 @@ class PlanTests(TempHomeCase):
 
     def test_refresh_managed_refuses_an_untracked_file(self):
         """§2: a real credential file is never refreshable."""
-        self.write(".netrc", "machine real.example login me password REAL\n")
+        self.write(".pgpass", "real.example:5432:proddb:me:REAL\n")
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("not recorded as a Honeypath-managed canary", entry.reason)
 
     def test_refresh_managed_refuses_a_tracked_file_without_the_marker(self):
         """Recorded in SQLite is not enough; the content must match too."""
-        path = self.write(".netrc", "machine real.example password REAL\n")
+        path = self.write(".pgpass", "real.example:5432:proddb:me:REAL\n")
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(path),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
@@ -196,58 +196,63 @@ class PlanTests(TempHomeCase):
             baseline_atime=None,
         )
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("exact managed identity", entry.reason)
 
     def test_refresh_managed_accepts_a_verified_managed_canary(self):
-        path = self.write(".netrc", "# Honeypath canary file\nmachine x.invalid\n")
+        path = self.write(
+            ".pgpass",
+            "# Honeypath canary file\ndb.x.invalid:5432:canarydb:canaryuser:fake\n",
+        )
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(path),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
             intrusiveness="low",
             baseline_atime=None,
             content_hash=catalog.sha256_text(path.read_text()),
-            managed_marker=catalog.managed_marker("linux.netrc"),
+            managed_marker=catalog.managed_marker("linux.pgpass"),
         )
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "refresh")
 
     def test_refresh_refuses_edited_file_even_with_honeypath_header(self):
-        original = "# Honeypath canary file\nmachine x.invalid\n"
-        path = self.write(".netrc", original)
+        original = (
+            "# Honeypath canary file\ndb.x.invalid:5432:canarydb:canaryuser:fake\n"
+        )
+        path = self.write(".pgpass", original)
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(path),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
             intrusiveness="low",
             baseline_atime=None,
             content_hash=catalog.sha256_text(original),
-            managed_marker=catalog.managed_marker("linux.netrc"),
+            managed_marker=catalog.managed_marker("linux.pgpass"),
         )
-        path.write_text(original + "machine real.example password REAL\n")
+        path.write_text(original + "real.example:5432:proddb:me:REAL\n")
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("exact content hash changed", entry.reason)
 
     def test_refresh_managed_refuses_a_symlink_even_when_tracked(self):
         outside = self.root / "real-secrets"
         outside.write_text("# honeypath\nREAL\n")
-        link = self.home / ".netrc"
+        link = self.home / ".pgpass"
         link.symlink_to(outside)
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(link),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
@@ -255,18 +260,18 @@ class PlanTests(TempHomeCase):
             baseline_atime=None,
         )
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("symlink", entry.reason)
         self.assertEqual(outside.read_text(), "# honeypath\nREAL\n")
 
     def test_refresh_managed_refuses_a_directory_even_when_tracked(self):
-        path = self.home / ".netrc"
+        path = self.home / ".pgpass"
         path.mkdir()
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(path),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
@@ -274,17 +279,17 @@ class PlanTests(TempHomeCase):
             baseline_atime=None,
         )
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("not a regular file", entry.reason)
 
     def test_refresh_managed_refuses_a_fifo_even_when_tracked(self):
-        path = self.home / ".netrc"
+        path = self.home / ".pgpass"
         os.mkfifo(path)
         self.db.record_canary(
-            canary_id="linux.netrc",
+            canary_id="linux.pgpass",
             path=str(path),
-            kind="netrc",
+            kind="pgpass",
             severity="critical",
             profile="linux-developer",
             platform="linux",
@@ -292,7 +297,7 @@ class PlanTests(TempHomeCase):
             baseline_atime=None,
         )
         items, _, _ = cli.build_plan(self.make_context(refresh_managed=True))
-        entry = next(i for i in items if str(i.path).endswith("/.netrc"))
+        entry = next(i for i in items if str(i.path).endswith("/.pgpass"))
         self.assertEqual(entry.action, "skip")
         self.assertIn("not a regular file", entry.reason)
 
@@ -386,14 +391,44 @@ class CreateCanariesTests(TempHomeCase):
             confirm=lambda _prompt: True,
         )
 
+    def make_macos_context(self, **kwargs):
+        platform = PlatformContext(
+            os_name="macos",
+            home=self.home,
+            windows_homes=[],
+            default_profiles=["macos-developer"],
+        )
+        return cli.Context(
+            args=namespace(profiles=["macos-developer"], **kwargs),
+            target=self.target,
+            platform=platform,
+            db=self.db,
+            confirm=lambda _prompt: True,
+        )
+
+    def test_macos_canaries_are_created_without_otmpfile(self):
+        """Darwin has no O_TMPFILE, and the workflow must still work there."""
+        with mock.patch.object(
+            safe_write, "supports_unnamed_temporary", return_value=False
+        ):
+            with self.quiet():
+                code = cli.cmd_create_canaries(self.make_macos_context())
+        self.assertEqual(code, 0)
+        recorded = [row.path for row in self.db.get_canaries()]
+        self.assertTrue(recorded, "no macOS canary was created")
+        for path in recorded:
+            self.assertTrue(
+                os.path.isfile(path), f"{path} was recorded but not written"
+            )
+
     def test_creates_and_records_canaries(self):
         with self.quiet():
             code = cli.cmd_create_canaries(self.make_context())
         self.assertEqual(code, 0)
-        self.assertTrue((self.home / ".netrc").exists())
+        self.assertTrue((self.home / ".pgpass").exists())
         recorded = {c.path for c in self.db.get_canaries()}
-        self.assertIn(str(self.home / ".netrc"), recorded)
-        row = self.db.get_canary_by_path(str(self.home / ".netrc"))
+        self.assertIn(str(self.home / ".pgpass"), recorded)
+        row = self.db.get_canary_by_path(str(self.home / ".pgpass"))
         assert row is not None
         self.assertIsNotNone(row.last_baseline_atime)
 
@@ -401,7 +436,7 @@ class CreateCanariesTests(TempHomeCase):
         """A create followed immediately by watch must start quietly."""
         with self.quiet():
             cli.cmd_create_canaries(self.make_context())
-        path = self.home / ".netrc"
+        path = self.home / ".pgpass"
         row = self.db.get_canary_by_path(str(path))
         assert row is not None
         self.assertEqual(row.last_baseline_atime, os.stat(path).st_atime_ns)
@@ -411,22 +446,26 @@ class CreateCanariesTests(TempHomeCase):
         )
         self.assertEqual(watcher.poll_once(), [])
 
-    def test_guided_setup_creates_safe_defaults_in_one_command(self):
-        ctx = self.make_context()
+    def answer_prompts(self, ctx, *, prepare_ssh: bool) -> None:
+        """Answer cmd_setup's prompts; unknown prompts raise rather than default."""
         answers = {
             "Configure optional Pushover": False,
             "Show the full": False,
             "Create these": True,
-            "Prepare SSH canary": False,
+            "Prepare SSH canary": prepare_ssh,
             "Install, enable": False,
         }
         ctx.confirm = lambda prompt: next(
             answer for prefix, answer in answers.items() if prompt.startswith(prefix)
         )
+
+    def test_guided_setup_creates_safe_defaults_in_one_command(self):
+        ctx = self.make_context()
+        self.answer_prompts(ctx, prepare_ssh=False)
         with self.quiet():
             code = cli.cmd_setup(ctx)
         self.assertEqual(code, 0)
-        self.assertTrue((self.home / ".netrc").is_file())
+        self.assertTrue((self.home / ".pgpass").is_file())
         self.assertGreater(len(self.db.get_canaries(active_only=True)), 0)
 
     def test_guided_setup_is_exposed_as_a_command(self):
@@ -437,16 +476,7 @@ class CreateCanariesTests(TempHomeCase):
 
     def test_guided_setup_offers_ssh_phase_one(self):
         ctx = self.make_context()
-        answers = {
-            "Configure optional Pushover": False,
-            "Show the full": False,
-            "Create these": True,
-            "Prepare SSH canary": True,
-            "Install, enable": False,
-        }
-        ctx.confirm = lambda prompt: next(
-            answer for prefix, answer in answers.items() if prompt.startswith(prefix)
-        )
+        self.answer_prompts(ctx, prepare_ssh=True)
         with mock.patch.object(
             cli, "cmd_setup_ssh_canary", return_value=0
         ) as setup_ssh:
@@ -455,6 +485,35 @@ class CreateCanariesTests(TempHomeCase):
 
         self.assertEqual(code, 0)
         setup_ssh.assert_called_once_with(ctx)
+
+    def setup_output(self, prepare_ssh: bool) -> str:
+        import contextlib
+        import io
+
+        ctx = self.make_context()
+        self.answer_prompts(ctx, prepare_ssh=prepare_ssh)
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "cmd_setup_ssh_canary", return_value=0):
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(cli.cmd_setup(ctx), 0)
+        return buffer.getvalue()
+
+    def test_guided_setup_closes_the_loop_on_ssh_phase_one(self):
+        """Phase 1 leaves a half-finished job; setup must say how to finish it."""
+        output = self.setup_output(prepare_ssh=True)
+        self.assertIn("prepared, not active", output)
+        # What to test ...
+        self.assertIn("~/bin/ssh -G github.com", output)
+        self.assertIn("never into ~/.ssh", output)
+        # ... and how to complete it, plus how to back out.
+        self.assertIn("setup-ssh-canary --activate", output)
+        self.assertIn("ssh-status", output)
+        self.assertIn("restore-ssh-canary", output)
+
+    def test_setup_stays_quiet_about_ssh_when_phase_one_was_declined(self):
+        output = self.setup_output(prepare_ssh=False)
+        self.assertNotIn("prepared, not active", output)
+        self.assertNotIn("--activate", output)
 
     def test_never_creates_under_ssh(self):
         with self.quiet():
@@ -466,11 +525,11 @@ class CreateCanariesTests(TempHomeCase):
     def test_is_idempotent(self):
         with self.quiet():
             cli.cmd_create_canaries(self.make_context())
-        content = (self.home / ".netrc").read_text()
+        content = (self.home / ".pgpass").read_text()
         before = len(self.db.get_canaries())
         with self.quiet():
             cli.cmd_create_canaries(self.make_context())
-        self.assertEqual((self.home / ".netrc").read_text(), content)
+        self.assertEqual((self.home / ".pgpass").read_text(), content)
         self.assertEqual(len(self.db.get_canaries()), before)
 
     def test_does_not_clobber_a_real_file(self):
@@ -489,12 +548,12 @@ class CreateCanariesTests(TempHomeCase):
         self.assertEqual((self.home / ".npmrc").read_text(), real)
 
     def test_top_level_force_is_rejected_outright(self):
-        real = "machine real.example login me password REAL\n"
-        self.write(".netrc", real)
+        real = "real.example:5432:proddb:me:REAL\n"
+        self.write(".pgpass", real)
         with self.quiet(stderr=True):
             code = cli.cmd_create_canaries(self.make_context(top_force=True))
         self.assertEqual(code, 2)
-        self.assertEqual((self.home / ".netrc").read_text(), real)
+        self.assertEqual((self.home / ".pgpass").read_text(), real)
 
     def test_plan_also_rejects_force(self):
         with self.quiet(stderr=True):
@@ -511,11 +570,11 @@ class CreateCanariesTests(TempHomeCase):
     def test_untracked_credential_file_survives_refresh_managed(self):
         """The whole point of §2, end to end."""
         real = "machine real.example login me password REALSECRET\n"
-        self.write(".netrc", real)
+        self.write(".pgpass", real)
         with self.quiet():
             code = cli.cmd_create_canaries(self.make_context(refresh_managed=True))
         self.assertEqual(code, 0)
-        self.assertEqual((self.home / ".netrc").read_text(), real)
+        self.assertEqual((self.home / ".pgpass").read_text(), real)
 
     def test_refresh_managed_updates_a_canary_with_canarytoken_material(self):
         """The supported replacement for the old `create-canaries --force`."""
@@ -568,23 +627,114 @@ class CreateCanariesTests(TempHomeCase):
     def test_dry_run_creates_nothing(self):
         with self.quiet():
             cli.cmd_create_canaries(self.make_context(dry_run=True))
-        self.assertFalse((self.home / ".netrc").exists())
+        self.assertFalse((self.home / ".pgpass").exists())
         self.assertEqual(self.db.get_canaries(), [])
 
     def test_database_failure_removes_exact_new_unregistered_canary(self):
         original = self.db.record_canary
 
-        def fail_netrc(**kwargs):
-            if kwargs["path"].endswith("/.netrc"):
+        def fail_pgpass(**kwargs):
+            if kwargs["path"].endswith("/.pgpass"):
                 raise OSError("database full")
             return original(**kwargs)
 
-        with mock.patch.object(self.db, "record_canary", side_effect=fail_netrc):
+        with mock.patch.object(self.db, "record_canary", side_effect=fail_pgpass):
             with self.quiet():
                 cli.cmd_create_canaries(self.make_context())
-        # The first catalog entry is .netrc; it must not remain unwatched.
-        self.assertFalse((self.home / ".netrc").exists())
-        self.assertIsNone(self.db.get_canary_by_path(str(self.home / ".netrc")))
+        # Whichever entry fails to record, it must not remain unwatched.
+        self.assertFalse((self.home / ".pgpass").exists())
+        self.assertIsNone(self.db.get_canary_by_path(str(self.home / ".pgpass")))
+
+    def failing_record_canary(self, suffix: str):
+        """Make record_canary() fail for one path, as a full disk would."""
+        original = self.db.record_canary
+
+        def record(**kwargs):
+            if kwargs["path"].endswith(suffix):
+                raise OSError("database full")
+            return original(**kwargs)
+
+        return mock.patch.object(self.db, "record_canary", side_effect=record)
+
+    def refresh_with_a_new_token(self, **kwargs):
+        token_file = self.root / "canarytoken.txt"
+        token_file.write_text(
+            "aws_access_key_id = AKIAOPERATOR000\n"
+            "aws_secret_access_key = operatorsecret\n"
+        )
+        context = self.make_context(
+            canarytoken_aws_file=str(token_file), refresh_managed=True, **kwargs
+        )
+        with self.quiet():
+            return cli.cmd_create_canaries(context)
+
+    def test_refresh_that_cannot_be_recorded_restores_the_previous_file(self):
+        """A refreshed file and its manifest row move together, or not at all."""
+        with self.quiet():
+            cli.cmd_create_canaries(self.make_context())
+        credentials = self.home / ".aws" / "credentials"
+        before_content = credentials.read_text()
+        before_inode = os.stat(credentials).st_ino
+        before_row = self.db.get_canary_by_path(str(credentials))
+        assert before_row is not None
+
+        with self.failing_record_canary("/credentials"):
+            self.refresh_with_a_new_token()
+
+        # The exact previous inode is back, not merely equivalent content.
+        self.assertEqual(credentials.read_text(), before_content)
+        self.assertNotIn("AKIAOPERATOR000", credentials.read_text())
+        self.assertEqual(os.stat(credentials).st_ino, before_inode)
+        after_row = self.db.get_canary_by_path(str(credentials))
+        assert after_row is not None
+        self.assertEqual(after_row.content_hash, before_row.content_hash)
+        self.assertEqual(after_row.file_ino, before_row.file_ino)
+
+    def test_a_rolled_back_refresh_can_be_retried(self):
+        """The bug this guards: a half-applied refresh poisons every later one."""
+        with self.quiet():
+            cli.cmd_create_canaries(self.make_context())
+        credentials = self.home / ".aws" / "credentials"
+
+        with self.failing_record_canary("/credentials"):
+            self.refresh_with_a_new_token()
+
+        self.assertEqual(self.refresh_with_a_new_token(), 0)
+        content = credentials.read_text()
+        self.assertIn("AKIAOPERATOR000", content)
+        row = self.db.get_canary_by_path(str(credentials))
+        assert row is not None
+        self.assertEqual(row.content_hash, catalog.sha256_text(content))
+        self.assertEqual(row.file_ino, os.stat(credentials).st_ino)
+
+    def test_a_rolled_back_refresh_does_not_look_like_tampering_to_watch(self):
+        with self.quiet():
+            cli.cmd_create_canaries(self.make_context())
+        credentials = self.home / ".aws" / "credentials"
+
+        with self.failing_record_canary("/credentials"):
+            self.refresh_with_a_new_token()
+
+        row = self.db.get_canary_by_path(str(credentials))
+        assert row is not None
+        info = os.stat(credentials)
+        self.assertEqual(row.file_ino, info.st_ino)
+        self.assertEqual(row.file_dev, info.st_dev)
+
+    def test_a_rolled_back_refresh_leaves_no_staging_entry(self):
+        with self.quiet():
+            cli.cmd_create_canaries(self.make_context())
+        credentials = self.home / ".aws" / "credentials"
+
+        with self.failing_record_canary("/credentials"):
+            self.refresh_with_a_new_token()
+
+        leftovers = [
+            p.name
+            for p in credentials.parent.iterdir()
+            if p.name.startswith(safe_write.TEMP_PREFIX)
+        ]
+        self.assertEqual(leftovers, [])
 
     def test_canarytoken_material_is_spliced(self):
         token_file = self.root / "canarytoken.txt"

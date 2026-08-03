@@ -197,6 +197,10 @@ class Database:
         self.empty_state = empty_state
         self._snapshot_owner = snapshot_owner
         self._connection_path = Path(connection_path) if connection_path else self.path
+        # Everything this process brought into existence, so a privileged run
+        # can hand it to the unprivileged user who has to write it afterwards.
+        self.created_directories: list[Path] = []
+        self.created_database = False
 
     @classmethod
     def dry_run_snapshot(cls, path: Path | str) -> "Database":
@@ -277,6 +281,15 @@ class Database:
     def exists(self) -> bool:
         return self.path.exists()
 
+    def state_paths(self) -> list[Path]:
+        """The database plus the WAL sidecars SQLite keeps beside it.
+
+        Ownership and permissions have to cover all three: a writable database
+        whose ``-wal``/``-shm`` companions belong to somebody else still fails
+        to open.
+        """
+        return [self.path] + [Path(f"{self.path}{s}") for s in ("-wal", "-shm")]
+
     def writable(self) -> tuple[bool, str]:
         """Can we create/write the database here?  Returns (ok, detail)."""
         target = self.path
@@ -296,7 +309,16 @@ class Database:
     def initialize(self) -> None:
         if self.read_only or self.empty_state:
             return
+        self.created_database = not self.path.exists()
+        missing: list[Path] = []
+        probe = self.path.parent
+        while not probe.exists():
+            missing.append(probe)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.created_directories = list(reversed(missing))
         with self.connection() as conn:
             for statement in _SCHEMA:
                 conn.execute(statement)
@@ -466,14 +488,21 @@ class Database:
                 )
         return generation
 
-    def pending_windows_records(self, *, limit: int = 1000) -> list[dict]:
+    def pending_windows_records(
+        self, *, limit: int = 1000, after_id: int = 0
+    ) -> list[dict]:
+        """Undelivered inbox rows with ``id > after_id``, oldest first.
+
+        ``after_id`` lets a caller page forward through a backlog larger than
+        ``limit``; without it every page would repeat the same oldest rows.
+        """
         with self.connection() as conn:
             return [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM windows_event_inbox WHERE delivered=0 "
+                    "SELECT * FROM windows_event_inbox WHERE delivered=0 AND id>? "
                     "ORDER BY id LIMIT ?",
-                    (limit,),
+                    (after_id, limit),
                 )
             ]
 
@@ -830,7 +859,7 @@ class Database:
         backup_path: str,
         activated_at: str,
         canaries: list[dict],
-        authorized_change: dict | None = None,
+        authorized_changes: list[dict] | None = None,
     ) -> None:
         """Commit all Phase-2 manifest changes in one SQLite transaction."""
         now = utc_now()
@@ -881,7 +910,7 @@ class Database:
                         item.get("file_ino"),
                     ),
                 )
-            if authorized_change is not None:
+            for authorized_change in authorized_changes or ():
                 conn.execute(
                     """
                     INSERT INTO managed_changes(

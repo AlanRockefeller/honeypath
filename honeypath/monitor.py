@@ -12,6 +12,27 @@ canary's atime is newer than its mtime, so subsequent reads would go
 unnoticed.  Honeypath therefore *re-arms* each canary after an observed
 access by bumping its mtime to now, restoring the "mtime newer than atime"
 condition the kernel needs.
+
+Two mechanisms here exist to keep routine machine activity from burying a real
+detection, and both keep every event in the database and the log file — they
+govern *delivery*, never recording:
+
+*Advisory hits*.  A detection method that cannot say who read the file is
+worth recording and not worth waking someone for, once it is known to fire on
+its own every hour.  Windows-canary atime is the case that matters: NTFS
+last-access updates (where they are enabled at all) are advanced by any backup
+agent, anti-malware scan or search indexer that walks the profile, DrvFS
+faithfully reports them, and no attribution accompanies them.  Those hits are
+marked advisory and recorded silently; a corroborating hit from SACL auditing
+or inotify in the same coalescing window clears the mark, because those methods
+*do* carry attribution.
+
+*Sweep aggregation*.  A profile-wide read touches every canary at once.  The
+first detection is delivered immediately — latency on the thing you want to
+know about is not negotiable — and the rest of the burst collapses into one
+summary.  A backup pass and a credential stealer both look like this, which is
+the point: twelve notifications say nothing that one summary naming twelve
+paths does not, and twelve notifications are the ones that get swiped away.
 """
 
 from __future__ import annotations
@@ -28,6 +49,7 @@ from pathlib import Path
 
 from . import alerts as alerts_mod
 from . import eventlog as eventlog_mod
+from . import procscan
 from . import safe_write
 from .database import CanaryRow, Database, WriterQueue, utc_now
 
@@ -48,6 +70,26 @@ DEFAULT_DEDUP_WINDOW = 2.0
 DEFAULT_COOLDOWN = 300.0
 DEFAULT_POLL_INTERVAL = 20.0
 
+# How a Windows canary's atime hits are treated.  ``log`` is the default: they
+# are recorded as events but never delivered, because on a host with NTFS
+# last-access updates enabled every backup and indexer pass produces a full set
+# of them with no attribution attached.  ``alert`` restores pre-0.2 behaviour;
+# ``off`` stops emitting them entirely.  Removal and replacement of a Windows
+# canary is always alerted on regardless — a scanner reads files, it does not
+# delete them.
+WINDOWS_ATIME_ALERT = "alert"
+WINDOWS_ATIME_LOG = "log"
+WINDOWS_ATIME_OFF = "off"
+WINDOWS_ATIME_MODES = (WINDOWS_ATIME_ALERT, WINDOWS_ATIME_LOG, WINDOWS_ATIME_OFF)
+DEFAULT_WINDOWS_ATIME = WINDOWS_ATIME_LOG
+
+# Sweep aggregation.  The window is a *quiet period*: it closes once nothing
+# new has arrived for this long, so a burst spread across several atime polls
+# stays one burst.  ``MAX`` bounds a sweep that never goes quiet.
+DEFAULT_SWEEP_WINDOW = 30.0
+DEFAULT_SWEEP_MAX = 300.0
+DEFAULT_SWEEP_THRESHOLD = 3
+
 
 @dataclass
 class RawHit:
@@ -58,6 +100,9 @@ class RawHit:
     process_info: str | None = None
     at: float = field(default_factory=time.time)
     durable_record_ids: tuple[int, ...] = ()
+    # Record it, do not deliver it.  Set by detection methods that are known
+    # to fire on routine machine activity and cannot name the reader.
+    advisory: bool = False
 
 
 @dataclass
@@ -69,6 +114,10 @@ class Coalesced:
     process_info: str | None
     first_seen: float
     durable_record_ids: list[int] = field(default_factory=list)
+    # Advisory only while *every* contributing hit was advisory: one method
+    # that can attribute the read is enough to make the whole event worth
+    # delivering.
+    advisory: bool = False
 
 
 class Watcher(threading.Thread):
@@ -102,11 +151,12 @@ class InotifyWatcher(Watcher):
 
     RESTART_BACKOFF = (1, 2, 5, 10, 30)
 
-    def __init__(self, paths, sink, stop_event, *, log=print):
+    def __init__(self, paths, sink, stop_event, *, log=print, attribute=True):
         super().__init__("honeypath-inotify", sink, stop_event)
         self.paths = {str(p) for p in paths}
         self.directories = sorted({str(Path(p).parent) for p in self.paths})
         self.log = log
+        self.attribute = attribute
         self.proc: subprocess.Popen | None = None
 
     @staticmethod
@@ -204,8 +254,26 @@ class InotifyWatcher(Watcher):
                 method=METHOD_INOTIFY,
                 event_type=event_type,
                 detail=raw_events,
+                process_info=self._attribute(full, names),
             )
         )
+
+    def _attribute(self, path: str, names: set[str]) -> str | None:
+        """Name the reader, if it is still holding the file open.
+
+        Only on OPEN: it is the first event of the burst and therefore the one
+        with any chance of catching the descriptor, and repeating the /proc
+        walk for the ACCESS and CLOSE_NOWRITE that follow would trade real work
+        for an answer that is at best identical and usually already stale.
+        """
+        if not self.attribute or "OPEN" not in names:
+            return None
+        try:
+            # Honeypath's own re-arming open would otherwise attribute every
+            # read to Honeypath.
+            return procscan.describe_readers(path, exclude_pids=(os.getpid(),))
+        except Exception:  # pragma: no cover - attribution must never throw
+            return None
 
     def _terminate(self) -> None:
         proc = self.proc
@@ -237,16 +305,19 @@ class AtimeWatcher(Watcher):
         writer=None,
         interval=DEFAULT_POLL_INTERVAL,
         rearm=True,
+        windows_atime=DEFAULT_WINDOWS_ATIME,
         log=print,
     ):
         super().__init__("honeypath-atime", sink, stop_event)
         self.interval = interval
         self.rearm = rearm
         self.writer = writer
+        self.windows_atime = windows_atime
         self.log = log
         self.baselines: dict[str, int] = {}
         self.identities: dict[str, tuple[int, int] | None] = {}
         self.rearmable: dict[str, bool] = {}
+        self.read_mode: dict[str, str] = {}
         self.seen_missing: set[str] = set()
         for canary in canaries:
             self.baselines[canary.path] = canary.last_baseline_atime or 0
@@ -260,12 +331,16 @@ class AtimeWatcher(Watcher):
             # every polling interval.  Windows atime is best-effort only; SACL
             # auditing is the reliable Windows-side mechanism.
             self.rearmable[canary.path] = canary.platform != "windows"
+            self.read_mode[canary.path] = (
+                windows_atime if canary.platform == "windows" else WINDOWS_ATIME_ALERT
+            )
 
     def add_path(self, path: str, baseline: int | None = None) -> None:
         if path not in self.baselines:
             self.baselines[path] = baseline or 0
             self.identities[path] = None
             self.rearmable[path] = True
+            self.read_mode[path] = WINDOWS_ATIME_ALERT
 
     @staticmethod
     def _root_for(path: str) -> Path:
@@ -278,7 +353,13 @@ class AtimeWatcher(Watcher):
         fd = safe_write.open_regular_nofollow(
             Path(path), root=self._root_for(path), flags=flags
         )
-        return fd, os.fstat(fd)
+        try:
+            return fd, os.fstat(fd)
+        except BaseException:
+            # Callers only ever close the fd they were handed; failing before
+            # the return would otherwise leak it on every polling pass.
+            os.close(fd)
+            raise
 
     def _identity_matches(self, path: str, st: os.stat_result) -> bool:
         expected = self.identities.get(path)
@@ -384,14 +465,20 @@ class AtimeWatcher(Watcher):
 
             previous = self.baselines.get(path, 0)
             if previous and st.st_atime_ns > previous:
-                hit = RawHit(
-                    path=path,
-                    method=METHOD_ATIME,
-                    event_type=EVENT_READ,
-                    detail=f"atime advanced {previous} -> {st.st_atime_ns}",
-                )
-                self.emit(hit)
-                emitted.append(hit)
+                mode = self.read_mode.get(path, WINDOWS_ATIME_ALERT)
+                # ``off`` still advances the baseline: silencing the read must
+                # not leave a stale baseline that re-fires the moment the mode
+                # is turned back up.
+                if mode != WINDOWS_ATIME_OFF:
+                    hit = RawHit(
+                        path=path,
+                        method=METHOD_ATIME,
+                        event_type=EVENT_READ,
+                        detail=f"atime advanced {previous} -> {st.st_atime_ns}",
+                        advisory=mode == WINDOWS_ATIME_LOG,
+                    )
+                    self.emit(hit)
+                    emitted.append(hit)
                 self.baselines[path] = st.st_atime_ns
                 self._persist(path, st.st_atime_ns)
                 if self.rearmable.get(path, True):
@@ -457,8 +544,13 @@ class Coalescer:
                 process_info=hit.process_info,
                 first_seen=hit.at,
                 durable_record_ids=list(hit.durable_record_ids),
+                advisory=hit.advisory,
             )
             return
+        # One attributable sighting promotes the whole event: if SACL auditing
+        # or inotify saw the same read that atime did, the event is no longer
+        # just an unexplained timestamp move.
+        pending.advisory = pending.advisory and hit.advisory
         if hit.method not in pending.methods:
             pending.methods.append(hit.method)
         if hit.detail and hit.detail not in pending.details:
@@ -505,6 +597,99 @@ class CooldownTracker:
         return max(0.0, self.seconds - (now - last))
 
 
+@dataclass
+class AlertJob:
+    """One Pushover message and the events whose delivery state it settles."""
+
+    body: str
+    events: list[tuple[int | None, dict]]
+
+
+class SweepAggregator:
+    """Collapses a burst that touched many canaries into a single alert.
+
+    The first detection of a burst is released immediately — whatever is
+    happening, the notification arrives with no added latency.  Everything that
+    follows is buffered until the burst goes quiet, and then either released
+    individually (a couple of stragglers) or summarised into one message (a
+    genuine sweep).
+
+    This is delivery policy only.  Every event was already written to SQLite and
+    the log file before it reached here, so nothing an aggregated alert omits
+    is actually lost.
+    """
+
+    def __init__(
+        self,
+        window: float = DEFAULT_SWEEP_WINDOW,
+        *,
+        maximum: float = DEFAULT_SWEEP_MAX,
+        threshold: int = DEFAULT_SWEEP_THRESHOLD,
+    ):
+        self.window = window
+        self.maximum = maximum
+        self.threshold = threshold
+        self._buffer: list[tuple[int | None, dict]] = []
+        self._opened: float | None = None
+        self._last: float | None = None
+
+    def offer(
+        self, event_id: int | None, event: dict, now: float | None = None
+    ) -> list[AlertJob]:
+        now = time.time() if now is None else now
+        if self.window <= 0:
+            return [_single(event_id, event)]
+        if self._opened is None:
+            self._opened = now
+            self._last = now
+            return [_single(event_id, event)]
+        self._buffer.append((event_id, event))
+        self._last = now
+        # A sweep that never goes quiet must still report; otherwise a machine
+        # reading canaries continuously would buffer silently forever.
+        if now - self._opened >= self.maximum:
+            return self._close()
+        return []
+
+    def due(self, now: float | None = None) -> list[AlertJob]:
+        now = time.time() if now is None else now
+        if self._opened is None:
+            return []
+        quiet = self._last is not None and now - self._last >= self.window
+        if quiet or now - self._opened >= self.maximum:
+            return self._close()
+        return []
+
+    def flush(self) -> list[AlertJob]:
+        """Release everything held, regardless of the window.  For shutdown."""
+        if self._opened is None:
+            return []
+        return self._close()
+
+    def pending(self) -> int:
+        return len(self._buffer)
+
+    def _close(self) -> list[AlertJob]:
+        buffered = self._buffer
+        self._buffer = []
+        self._opened = None
+        self._last = None
+        if not buffered:
+            return []
+        if len(buffered) < self.threshold:
+            return [_single(event_id, event) for event_id, event in buffered]
+        return [
+            AlertJob(
+                body=alerts_mod.format_sweep_alert([event for _, event in buffered]),
+                events=list(buffered),
+            )
+        ]
+
+
+def _single(event_id: int | None, event: dict) -> AlertJob:
+    return AlertJob(body=alerts_mod.format_alert(event), events=[(event_id, event)])
+
+
 class Monitor:
     """Wires the watchers, the coalescer, the writer queue and the alerter."""
 
@@ -521,12 +706,19 @@ class Monitor:
         enable_atime: bool = True,
         win_audit_watcher=None,
         rearm: bool = True,
+        windows_atime: str = DEFAULT_WINDOWS_ATIME,
+        attribute_readers: bool = True,
+        sweep_window: float = DEFAULT_SWEEP_WINDOW,
+        sweep_max: float = DEFAULT_SWEEP_MAX,
+        sweep_threshold: int = DEFAULT_SWEEP_THRESHOLD,
         log=print,
         event_log=None,
     ):
         self.db = db
         self.canaries = {c.path: c for c in canaries}
         self.log = log
+        # Kept so shutdown can bound its drain against the real poll cycle.
+        self.poll_interval = poll_interval
         # Console output is for whoever is watching the terminal; the event log
         # is what survives to be read after the fact.  Both get every failure.
         self.event_log = (
@@ -536,17 +728,31 @@ class Monitor:
         self.hits: "queue.Queue[RawHit]" = queue.Queue()
         self.coalescer = Coalescer(dedup_window)
         self.cooldown = CooldownTracker(cooldown)
+        self.sweep = SweepAggregator(
+            sweep_window, maximum=sweep_max, threshold=sweep_threshold
+        )
         self.pushover = pushover if pushover is not None else alerts_mod.Pushover()
         self.writer = WriterQueue(db)
         self.hostname = alerts_mod.hostname()
-        self.counts = {"events": 0, "alerts": 0, "suppressed": 0, "muted": 0}
+        self.counts = {
+            "events": 0,
+            "alerts": 0,
+            "suppressed": 0,
+            "muted": 0,
+            "advisory": 0,
+            "swept": 0,
+        }
 
         # Everything a watcher logs is a failure or a degradation — a dead
         # inotifywait, a canary it could not re-arm — so it belongs in the log
         # file at WARN, not only on a terminal nobody is reading.
         self.inotify = (
             InotifyWatcher(
-                self.canaries.keys(), self.hits, self.stop_event, log=self._warn
+                self.canaries.keys(),
+                self.hits,
+                self.stop_event,
+                log=self._warn,
+                attribute=attribute_readers,
             )
             if enable_inotify
             else None
@@ -559,6 +765,7 @@ class Monitor:
                 writer=self.writer,
                 interval=poll_interval,
                 rearm=rearm,
+                windows_atime=windows_atime,
                 log=self._warn,
             )
             if enable_atime
@@ -639,8 +846,19 @@ class Monitor:
         # A producer that timed out may still return from an OS/PowerShell
         # call and enqueue detections.  Keep draining until every producer has
         # definitely terminated; shutting the writer down earlier creates a
-        # deterministic loss window.
+        # deterministic loss window.  A watcher wedged in an uninterruptible
+        # call must not hang shutdown forever, so the drain is bounded by a
+        # deadline comfortably longer than a normal poll cycle.
+        drain_timeout = max(2.0 * self.poll_interval, DEFAULT_POLL_INTERVAL)
+        drain_deadline = time.monotonic() + drain_timeout
         while any(watcher.is_alive() for watcher in watchers):
+            if time.monotonic() >= drain_deadline:
+                stuck = [w.name for w in watchers if w.is_alive()]
+                self._warn(
+                    f"[shutdown] still running after {drain_timeout:.0f}s, "
+                    f"abandoning: {', '.join(stuck)}"
+                )
+                break
             for watcher in watchers:
                 if watcher.is_alive():
                     watcher.join(0.05)
@@ -658,6 +876,10 @@ class Monitor:
                 break
         for item in self.coalescer.flush():
             self._dispatch(item)  # synchronous event insert: durable before alerts
+        # Whatever the sweep aggregator is still holding goes out now: shutting
+        # down is not a reason to drop an alert that was merely waiting for its
+        # burst to finish.
+        self._release_sweep(final=True)
         self.writer.drain()
 
         self._alert_queue.put(None)
@@ -704,6 +926,7 @@ class Monitor:
                 break
         for item in self.coalescer.due():
             self._dispatch(item)
+        self._release_sweep()
 
     # -- dispatch ----------------------------------------------------------
 
@@ -735,6 +958,14 @@ class Monitor:
             self.counts["muted"] += 1
             event["pushover_error"] = "suppressed: alerts muted"
             alertable = False
+        elif alertable and item.advisory:
+            # Checked before the cooldown deliberately: an advisory hit must
+            # not consume the path's cooldown slot, or a scanner touching a
+            # canary would blind Honeypath to a real read of the same file for
+            # the next five minutes.
+            self.counts["advisory"] += 1
+            event["pushover_error"] = "suppressed: advisory detection method"
+            alertable = False
         elif alertable and not self.cooldown.allow(item.path):
             self.counts["suppressed"] += 1
             event["pushover_error"] = "suppressed: per-path cooldown"
@@ -760,7 +991,16 @@ class Monitor:
         # ``None`` means every durable Windows inbox row in this coalesced item
         # was already consumed after a retry; do not send a duplicate alert.
         if alertable and (event_id is not None or not item.durable_record_ids):
-            self._alert_queue.put((event_id, dict(event)))
+            for job in self.sweep.offer(event_id, dict(event)):
+                self._alert_queue.put(job)
+
+    def _release_sweep(self, *, final: bool = False) -> None:
+        """Hand any burst the aggregator is done with to the alert thread."""
+        jobs = self.sweep.flush() if final else self.sweep.due()
+        for job in jobs:
+            if len(job.events) > 1:
+                self.counts["swept"] += len(job.events)
+            self._alert_queue.put(job)
 
     def _alert_loop(self) -> None:
         while True:
@@ -768,9 +1008,6 @@ class Monitor:
             try:
                 if item is None:
                     return
-                event_id, event = item
-                body = alerts_mod.format_alert(event)
-                priority = alerts_mod.alert_priority(event.get("severity"))
                 configured = getattr(self.pushover, "configured", None)
                 if callable(configured) and not configured():
                     # cmd_watch prints one actionable startup message.  Keep
@@ -778,15 +1015,19 @@ class Monitor:
                     # missing-file failure for every detected path.
                     sent, error = False, "pushover not configured"
                 else:
-                    sent, error = self.pushover.send(body, priority=priority)
+                    sent, error = self.pushover.send(item.body)
                 if sent:
                     self.counts["alerts"] += 1
                 elif error != "pushover not configured":
                     self.log(f"[pushover] delivery failed: {error}")
-                # ``error`` is already redacted by Pushover.send; nothing on
-                # this path can put a credential into the log file.
-                self.event_log.delivery(event, sent, error)
-                if event_id is not None:
-                    self.writer.update_event_delivery(event_id, sent, error)
+                # One message can settle several events.  Each still gets its
+                # own delivery record, so `events` never claims an event was
+                # delivered on its own when it went out inside a summary.
+                for event_id, event in item.events:
+                    # ``error`` is already redacted by Pushover.send; nothing
+                    # on this path can put a credential into the log file.
+                    self.event_log.delivery(event, sent, error)
+                    if event_id is not None:
+                        self.writer.update_event_delivery(event_id, sent, error)
             finally:
                 self._alert_queue.task_done()

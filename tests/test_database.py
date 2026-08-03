@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import closing
 import unittest
 
 from .support import TempHomeCase
@@ -75,14 +76,14 @@ class SchemaTests(TempHomeCase):
                 "INSERT INTO windows_event_inbox VALUES(10,'/x','old',NULL,1,NULL,1)"
             )
 
-        legacy = Database(path)
-        legacy.initialize()
-        with legacy.connection() as conn:
-            columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(windows_event_inbox)")
-            }
-            row = conn.execute("SELECT * FROM windows_event_inbox").fetchone()
+        with closing(Database(path)) as legacy:
+            legacy.initialize()
+            with legacy.connection() as conn:
+                columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(windows_event_inbox)")
+                }
+                row = conn.execute("SELECT * FROM windows_event_inbox").fetchone()
         self.assertTrue({"id", "log_generation", "record_id"} <= columns)
         self.assertEqual(row["id"], 10)
         self.assertEqual(row["log_generation"], 0)
@@ -106,8 +107,8 @@ class SchemaTests(TempHomeCase):
         self.assertEqual(rows[0].kind, "netrc-updated")
 
     def test_writable_reports_a_missing_parent(self):
-        db = Database(self.root / "nope" / "deeper" / "events.sqlite3")
-        ok, detail = db.writable()
+        with closing(Database(self.root / "nope" / "deeper" / "events.sqlite3")) as db:
+            ok, detail = db.writable()
         self.assertTrue(ok)
         self.assertIn("would create", detail)
 
@@ -201,7 +202,7 @@ class WriterQueueTests(TempHomeCase):
             thread.start()
         for thread in threads:
             thread.join()
-        writer._queue.join()
+        writer.drain()
         writer.stop()
 
         self.assertEqual(errors, [])
@@ -222,7 +223,7 @@ class WriterQueueTests(TempHomeCase):
             )
             self.assertGreater(event_id, 0)
             writer.update_event_delivery(event_id, True, None)
-            writer._queue.join()
+            writer.drain()
         finally:
             writer.stop()
         row = self.db.recent_events(limit=1)[0]
@@ -261,7 +262,7 @@ class WriterQueueTests(TempHomeCase):
                 )
             # A separate short-lived read connection must not be blocked out.
             self.db.recent_events(limit=5)
-            writer._queue.join()
+            writer.drain()
         finally:
             writer.stop()
         self.assertEqual(self.db.count_events(), 50)

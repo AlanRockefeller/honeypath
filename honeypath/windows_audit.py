@@ -18,9 +18,14 @@ renames and deletes, never reads.
 
 from __future__ import annotations
 
+import csv
+import fnmatch
+import io
 import json
 import hashlib
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,7 +39,12 @@ from .platform_detect import (
     run_interop,
     run_powershell,
     to_windows_path,
+    wsl_distro_name,
 )
+
+# Returned when the work was handed off to a separate elevated session rather
+# than performed here.  Distinct from success (0) and from failure (1).
+EXIT_HANDED_OFF = 3
 
 CHANGE_SACL = "windows-sacl"
 CHANGE_AUDIT_POLICY = "windows-audit-policy"
@@ -44,6 +54,70 @@ CHANGE_FSUTIL = "windows-fsutil-lastaccess"
 TASK_NAME = "HoneypathCanaryWatcher"
 LAST_RECORD_KEY = "win_audit_last_record_id"
 LOG_GENERATION_KEY = "win_audit_log_generation"
+
+# Backup agents, anti-malware and search indexers open every file in a profile
+# on a schedule.  4663 records the read faithfully and cannot say why, so on a
+# host running any of these, an un-allowlisted watcher reports a full set of
+# canary reads every scan.  These are the usual offenders, offered behind an
+# explicit opt-in (``--allow-known-scanners``) rather than applied by default:
+# allowlisting is a blind spot, and Honeypath does not create blind spots on a
+# user's behalf without being asked.
+KNOWN_SCANNER_PROCESSES = (
+    # Backblaze
+    "bztransmit*.exe",
+    "bzserv.exe",
+    "bzfilelist.exe",
+    "bzbui.exe",
+    # Microsoft Defender
+    "MsMpEng.exe",
+    "MpDefenderCoreService.exe",
+    "MpCopyAccelerator.exe",
+    # Windows Search
+    "SearchIndexer.exe",
+    "SearchProtocolHost.exe",
+    "SearchFilterHost.exe",
+)
+
+
+class ProcessAllowlist:
+    """Process-image patterns whose reads are recorded but never delivered.
+
+    Matching is case-insensitive ``fnmatch`` against both the full image path
+    and its basename, so ``bzserv.exe`` and ``C:\\Program Files\\Backblaze\\*``
+    are both usable.
+
+    Be clear about what this costs.  An allowlisted process is a hole: malware
+    that runs inside one — injected, or simply named to match a loose pattern —
+    reads every canary without waking anyone.  Prefer basenames over
+    directories, keep the list short, and remember that the events are still in
+    SQLite and the log file, so ``honeypath.py events`` remains the ground
+    truth regardless of what was delivered.
+    """
+
+    def __init__(self, patterns: Sequence[str] = ()):
+        self.patterns = [p.strip().lower() for p in patterns if p and p.strip()]
+
+    def __bool__(self) -> bool:
+        return bool(self.patterns)
+
+    def matches(self, process_info: str | None) -> str | None:
+        """The pattern that matched, or None.
+
+        Accepts either a bare image path or the ``"<image> pid=N user=U"`` form
+        stored in ``events.process_info``, so the same allowlist works on live
+        records and on inbox rows replayed after a restart.
+        """
+        if not process_info:
+            return None
+        image = str(process_info).split(" pid=", 1)[0].strip().lower()
+        if not image:
+            return None
+        base = image.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        for pattern in self.patterns:
+            if fnmatch.fnmatch(image, pattern) or fnmatch.fnmatch(base, pattern):
+                return pattern
+        return None
+
 
 _PS_EXTRACT_4663 = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -114,29 +188,130 @@ def is_elevated() -> bool | None:
     )
 
 
+def _ps_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _entrypoint() -> Path | None:
+    """The honeypath.py an elevated session should run, or None if unknown."""
+    candidate = Path(sys.argv[0]).resolve()
+    if candidate.is_file():
+        return candidate
+    # ``-c``, a REPL, or an odd launcher: honeypath.py sits beside the package.
+    beside = Path(__file__).resolve().parent.parent / "honeypath.py"
+    return beside if beside.is_file() else None
+
+
+def relaunch_argv(command: str, extra: Sequence[str] = ()) -> list[str] | None:
+    """The WSL-side argv that re-runs this Honeypath command as root."""
+    entrypoint = _entrypoint()
+    if entrypoint is None:
+        return None
+    return [sys.executable or "python3", str(entrypoint), command, *extra]
+
+
+def elevation_command(
+    command: str = "setup-windows-audit", extra: Sequence[str] = ()
+) -> tuple[str, str] | None:
+    """``(powershell_script, human_readable_command)`` to re-run elevated.
+
+    ``None`` when the distribution name or the entrypoint cannot be determined.
+    Neither may be guessed: ``wsl.exe -d`` with a wrong or empty name fails with
+    ``WSL_E_DISTRO_NOT_FOUND``, which is exactly the dead end this replaces.
+    """
+    distro = wsl_distro_name()
+    if not distro:
+        return None
+    argv = relaunch_argv(command, extra)
+    if argv is None:
+        return None
+    inner = ["-d", distro, "-u", "root", "--", *argv]
+    # cmd.exe /k keeps the elevated console open once the run finishes; without
+    # it the window closes instantly and takes the output with it.
+    listed = ", ".join(_ps_single_quote(arg) for arg in ["/k", "wsl.exe", *inner])
+    script = f"Start-Process -FilePath 'cmd.exe' -Verb RunAs -ArgumentList {listed}"
+    return script, "wsl.exe " + " ".join(inner)
+
+
+def relaunch_elevated(
+    command: str = "setup-windows-audit", extra: Sequence[str] = ()
+) -> tuple[bool, str]:
+    """Ask Windows for elevation via UAC and re-run Honeypath in a new console."""
+    built = elevation_command(command, extra)
+    if built is None:
+        return False, "could not determine this WSL distribution's name"
+    # The UAC dialog blocks until the user answers it, so this needs far longer
+    # than the ordinary interop timeout.
+    result = run_powershell(built[0], timeout=180)
+    if result.ok:
+        return True, "elevated session launched"
+    detail = result.error or result.stderr.strip() or "Start-Process failed"
+    if "cancel" in detail.lower():
+        detail = "the UAC prompt was declined"
+    return False, detail
+
+
+def _offer_elevation(log, confirm, relaunch_extra: Sequence[str]) -> int:
+    """Handle the un-elevated case: offer UAC, else print a usable fallback."""
+    log("This WSL session cannot run elevated Windows commands, and SACL changes")
+    log("require SeSecurityPrivilege — they would fail here.")
+    built = elevation_command(extra=relaunch_extra)
+
+    if built is not None and confirm is not None:
+        log("\nHoneypath can re-run this step in an elevated session for you:")
+        log(f"    {built[1]}")
+        if confirm("Request Windows elevation now? (a UAC prompt will appear)"):
+            ok, detail = relaunch_elevated(extra=relaunch_extra)
+            if ok:
+                log("An elevated console is now running the setup — follow it there.")
+                log("This session changed nothing.")
+                return EXIT_HANDED_OFF
+            log(f"Elevation failed: {detail}")
+
+    log("\nTo do it by hand, open an ELEVATED PowerShell on Windows and run:")
+    log('    auditpol /set /subcategory:"File System" /success:enable')
+    if built is not None:
+        log("then, from that same elevated PowerShell:")
+        log(f"    {built[1]}")
+    else:
+        log("then re-run setup-windows-audit from an elevated WSL session.")
+        log("This distribution's name could not be determined; `wsl.exe -l -q`")
+        log("lists the names accepted by `wsl.exe -d <name>`.")
+    log("\nNo changes were made from this session.")
+    return 1
+
+
+# The Object Access / File System subcategory.  auditpol accepts the GUID as
+# well as the name, and the GUID is the same on every Windows locale — matching
+# the literal string "File System" in the output silently finds nothing on a
+# non-English install, which reads as "auditing is off".
+FILE_SYSTEM_SUBCATEGORY_GUID = "{0CCE921D-69AE-11D9-BED3-505054503030}"
+_SUBCATEGORY_ARG = f"/subcategory:{FILE_SYSTEM_SUBCATEGORY_GUID}"
+
+
 def audit_policy_state() -> tuple[str | None, str | None]:
-    result = run_interop(["auditpol.exe", "/get", "/subcategory:File System"])
+    # /r emits CSV, so the row is located by GUID column rather than by a
+    # localized label.
+    result = run_interop(["auditpol.exe", "/get", _SUBCATEGORY_ARG, "/r"])
     if not result.ok:
         return None, result.error or result.stderr.strip() or "auditpol failed"
-    for line in result.stdout.splitlines():
-        if "File System" in line:
-            return line.strip(), None
+    guid = FILE_SYSTEM_SUBCATEGORY_GUID.lower()
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) < 5 or row[3].strip().lower() != guid:
+            continue
+        return f"{row[2].strip()}: {row[4].strip()}", None
     return result.stdout.strip() or None, None
 
 
 def enable_audit_policy() -> tuple[bool, str]:
-    result = run_interop(
-        ["auditpol.exe", "/set", "/subcategory:File System", "/success:enable"]
-    )
+    result = run_interop(["auditpol.exe", "/set", _SUBCATEGORY_ARG, "/success:enable"])
     if result.ok:
         return True, "object-access auditing (File System / Success) enabled"
     return False, result.error or result.stderr.strip() or "auditpol failed"
 
 
 def disable_success_audit_policy() -> tuple[bool, str]:
-    result = run_interop(
-        ["auditpol.exe", "/set", "/subcategory:File System", "/success:disable"]
-    )
+    result = run_interop(["auditpol.exe", "/set", _SUBCATEGORY_ARG, "/success:disable"])
     if result.ok:
         return True, "File System / Success auditing disabled"
     return False, result.error or result.stderr.strip() or "auditpol failed"
@@ -245,13 +420,20 @@ def restore_exact_sacl(
         " $sections = [System.Security.AccessControl.AccessControlSections]::Audit;"
         " $acl = Get-Acl -Path $p -Audit -ErrorAction Stop;"
         " $current = $acl.GetSecurityDescriptorSddlForm($sections);"
-        " if ($current -cne $expected) { 'CONFLICT: current SACL changed independently'; exit 3 };"
-        " $acl.SetSecurityDescriptorSddlForm($before, $sections);"
-        " Set-Acl -Path $p -AclObject $acl -ErrorAction Stop;"
-        " $verify = (Get-Acl -Path $p -Audit -ErrorAction Stop)."
+        # `exit 3` here would end the PowerShell process with a non-zero status,
+        # so run_powershell reports a generic failure and the CONFLICT reason
+        # never reaches the caller.  Fall through an else branch instead: the
+        # message is the only output, and the caller sees why nothing changed.
+        " if ($current -cne $expected) {"
+        "   'CONFLICT: current SACL changed independently'"
+        " } else {"
+        "   $acl.SetSecurityDescriptorSddlForm($before, $sections);"
+        "   Set-Acl -Path $p -AclObject $acl -ErrorAction Stop;"
+        "   $verify = (Get-Acl -Path $p -Audit -ErrorAction Stop)."
         "GetSecurityDescriptorSddlForm($sections);"
-        " if ($verify -cne $before) { throw 'exact SACL verification failed' };"
-        " 'OK: exact original SACL restored'"
+        "   if ($verify -cne $before) { throw 'exact SACL verification failed' };"
+        "   'OK: exact original SACL restored'"
+        " }"
         "} catch { 'ERR: ' + $_.Exception.Message }"
     )
     result = run_powershell(script, timeout=30)
@@ -327,6 +509,7 @@ def setup_windows_audit(
     log=print,
     offer_fsutil: bool = True,
     confirm=None,
+    relaunch_extra: Sequence[str] = (),
 ) -> int:
     """Enable Windows object-access auditing for the recorded Windows canaries."""
     if not interop_available():
@@ -336,14 +519,13 @@ def setup_windows_audit(
 
     elevated = is_elevated()
     if elevated is False:
-        log("This WSL session cannot run elevated Windows commands.")
-        log("Open an ELEVATED PowerShell on Windows and run:")
-        log('    auditpol /set /subcategory:"File System" /success:enable')
-        log("then re-run this command from an elevated WSL session:")
-        log(
-            "    wsl.exe -d $WSL_DISTRO_NAME -- sudo python3 honeypath.py setup-windows-audit"
-        )
-        log("(SACL changes require SeSecurityPrivilege; they will fail without it.)")
+        # Nothing below this point can succeed without SeSecurityPrivilege, so
+        # hand off to an elevated session instead of prompting for changes that
+        # are guaranteed to fail partway through.
+        if not dry_run:
+            return _offer_elevation(log, confirm, relaunch_extra)
+        log("NOTE: this session is not elevated; a real run needs Windows admin")
+        log("      rights, which Honeypath will offer to request via UAC.\n")
 
     canaries = windows_canary_paths(db)
     if not canaries:
@@ -470,8 +652,10 @@ def setup_windows_audit(
         for change_id in recorded_ids:
             try:
                 db.retire_managed_change(change_id)
-            except Exception:
-                pass
+            except Exception as retire_exc:
+                # Rollback continues regardless, but a stale managed_changes row
+                # will confuse a later --restore, so say which one survived.
+                log(f"  could not retire managed change {change_id}: {retire_exc}")
         return 1
 
     log(f"\nAudit ACEs applied: {applied}, failed: {failed}")
@@ -492,14 +676,18 @@ def setup_windows_audit(
                 ):
                     ok, detail = set_fsutil_lastaccess("0")
                     log(f"fsutil: {'OK' if ok else 'FAILED'} — {detail}")
-                    db.record_managed_change(
-                        change_type=CHANGE_FSUTIL,
-                        target="disablelastaccess",
-                        previous_existed=True,
-                        previous_value=value,
-                        new_value="0" if ok else None,
-                        notes="offered by setup-windows-audit",
-                    )
+                    if ok:
+                        # Only a setting we actually changed is ours to restore;
+                        # recording a failed attempt would make --restore put
+                        # back a value the system never left.
+                        db.record_managed_change(
+                            change_type=CHANGE_FSUTIL,
+                            target="disablelastaccess",
+                            previous_existed=True,
+                            previous_value=value,
+                            new_value="0",
+                            notes="offered by setup-windows-audit",
+                        )
 
     return 0
 
@@ -532,7 +720,10 @@ while ($true) {{
     foreach ($queuedLine in @(Get-Content $QueueFile)) {{
       try {{
         $queuedHit = $queuedLine | ConvertFrom-Json
-        $QueuedIds[[string]([int64]$queuedHit.RecordId)] = $true
+        # Keyed on time+RecordId: the Security log restarts RecordIds at 1
+        # after a clear, so an id alone would silently discard a new read
+        # that reuses the id of one still sitting in the queue.
+        $QueuedIds[([string]$queuedHit.TimeCreated + '/' + [string]([int64]$queuedHit.RecordId))] = $true
       }} catch {{}}
     }}
   }}
@@ -555,9 +746,10 @@ while ($true) {{
       foreach ($p in $Paths) {{
         if ($obj -and $obj.ToLower() -eq $p.ToLower()) {{
           # Durable local queue first.  Alert failure cannot lose the detection.
-          $recordKey = [string]([int64]$e.RecordId)
+          $recordTime = '{{0:o}}' -f $e.TimeCreated
+          $recordKey = $recordTime + '/' + [string]([int64]$e.RecordId)
           if (-not $QueuedIds.ContainsKey($recordKey)) {{
-            [pscustomobject]@{{RecordId=[int64]$e.RecordId;ObjectName=$obj;ProcessName=[string]$d['ProcessName']}} |
+            [pscustomobject]@{{RecordId=[int64]$e.RecordId;TimeCreated=$recordTime;ObjectName=$obj;ProcessName=[string]$d['ProcessName']}} |
               ConvertTo-Json -Compress | Add-Content -Path $QueueFile
             $QueuedIds[$recordKey] = $true
           }}
@@ -577,7 +769,7 @@ while ($true) {{
         $hit = $line | ConvertFrom-Json
         $msg = "HONEYPATH win-audit read`n" + $hit.ObjectName + "`n" + $hit.ProcessName
         Invoke-RestMethod -Method Post -Uri 'https://api.pushover.net/1/messages.json' -Body @{{
-          token=$Token; user=$User; title='Honeypath'; message=$msg; priority=1
+          token=$Token; user=$User; title='Honeypath'; message=$msg; priority=0
         }} -ErrorAction Stop | Out-Null
       }} catch {{ $remaining.Add($line) }}
     }}
@@ -841,6 +1033,7 @@ class WinAuditWatcher(Watcher):
         *,
         interval: float = 60.0,
         max_events: int = 400,
+        allowlist: ProcessAllowlist | None = None,
         log=print,
     ):
         import queue as _queue
@@ -854,6 +1047,7 @@ class WinAuditWatcher(Watcher):
         self.db = db
         self.interval = interval
         self.max_events = max_events
+        self.allowlist = allowlist if allowlist is not None else ProcessAllowlist()
         self.log = log
         # Windows path (lowercased) -> WSL path
         self.path_map: dict[str, str] = {}
@@ -867,31 +1061,54 @@ class WinAuditWatcher(Watcher):
 
     def _emit_pending_inbox(self, *, catch_up: bool = False) -> int:
         emitted = 0
+        after_id = 0
+        still_pending: set[int] = set()
         while True:
-            rows = self.db.pending_windows_records(limit=self.max_events)
+            # Page forward by id: querying the same oldest window repeatedly
+            # would never reach a backlog deeper than max_events, because rows
+            # stay pending until their alert is acknowledged.
+            rows = self.db.pending_windows_records(
+                limit=self.max_events, after_id=after_id
+            )
+            if not rows:
+                break
+            after_id = max(int(row["id"]) for row in rows)
+            still_pending.update(int(row["id"]) for row in rows)
             fresh = [r for r in rows if int(r["id"]) not in self._emitted_inbox_ids]
-            if not fresh:
-                return emitted
             for row in fresh:
                 inbox_id = int(row["id"])
                 detail = row["detail"]
                 if catch_up and "(catch-up)" not in detail:
                     detail += " (catch-up)"
+                # Applied here rather than at staging time so the inbox stays a
+                # verbatim record of what Windows reported: changing the
+                # allowlist re-classifies rows that are replayed after a
+                # restart, and never rewrites what was observed.
+                process_info = row.get("process_info")
+                allowed = self.allowlist.matches(process_info)
+                if allowed:
+                    detail += f" [allowlisted process: {allowed}]"
                 self.emit(
                     RawHit(
                         path=row["path"],
                         method=METHOD_WIN_AUDIT,
                         event_type=EVENT_READ,
                         detail=detail,
-                        process_info=row.get("process_info"),
+                        process_info=process_info,
                         at=float(row.get("observed_at") or time.time()),
                         durable_record_ids=(inbox_id,),
+                        advisory=allowed is not None,
                     )
                 )
                 self._emitted_inbox_ids.add(inbox_id)
                 emitted += 1
             if len(rows) < self.max_events:
-                return emitted
+                break
+        # Drop ids that have since been delivered: the set exists only to stop
+        # re-emitting rows that are still pending, and would otherwise grow
+        # without bound for the lifetime of the watcher.
+        self._emitted_inbox_ids &= still_pending
+        return emitted
 
     def run(self) -> None:  # pragma: no cover - needs a live Windows host
         if not self.path_map:

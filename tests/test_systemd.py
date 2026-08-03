@@ -7,6 +7,7 @@ edit a .py file and wait for the next restart to obtain root.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import unittest
@@ -16,7 +17,9 @@ from unittest import mock
 from .support import TempHomeCase, namespace
 
 from honeypath import cli  # noqa: E402
+from honeypath.database import Database  # noqa: E402
 from honeypath.platform_detect import PlatformContext  # noqa: E402
+from honeypath.target_user import TargetUserContext  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECKED_IN_UNIT = REPO_ROOT / "systemd" / "honeypath.service"
@@ -64,7 +67,10 @@ class UnitSafetyChecks:
 
         # 3. Privilege-raising directives must be absent.
         self.assertNotIn("PermissionsStartOnly", parsed)
-        self.assertEqual(parsed.get("NoNewPrivileges", ["yes"])[0], "yes")
+        # Defaulting these lookups would let a unit that omits the directive
+        # entirely pass the check it exists to enforce.
+        self.assertIn("NoNewPrivileges", parsed)
+        self.assertEqual(parsed["NoNewPrivileges"][0], "yes")
         for forbidden in ("AmbientCapabilities", "CapabilityBoundingSet", "SecureBits"):
             self.assertNotIn(
                 forbidden,
@@ -77,8 +83,9 @@ class UnitSafetyChecks:
         self.assertNotIn(
             "ProtectHome", parsed, "ProtectHome would hide the canaries being watched"
         )
+        self.assertIn("ProtectSystem", parsed)
         self.assertEqual(
-            parsed.get("ProtectSystem", ["full"])[0],
+            parsed["ProtectSystem"][0],
             "full",
             "ProtectSystem=strict would break the state directory",
         )
@@ -86,7 +93,8 @@ class UnitSafetyChecks:
         # 5. State directory management.
         self.assertIn("StateDirectory", parsed)
         self.assertEqual(parsed["StateDirectory"][0], "honeypath")
-        self.assertEqual(parsed.get("StateDirectoryMode", ["0700"])[0], "0700")
+        self.assertIn("StateDirectoryMode", parsed)
+        self.assertEqual(parsed["StateDirectoryMode"][0], "0700")
 
 
 class GeneratedUnitTests(TempHomeCase, UnitSafetyChecks):
@@ -154,7 +162,7 @@ class GeneratedUnitTests(TempHomeCase, UnitSafetyChecks):
         ctx = self.make_context(log_file=str(log_path))
         unit = cli.systemd_unit_text(ctx)
         parsed = directives(unit)
-        self.assertIn(f"--log-file {log_path}", parsed["ExecStart"][0])
+        self.assertIn(f'--log-file "{log_path}"', parsed["ExecStart"][0])
         self.assertIn(str(log_path.parent), parsed["ReadWritePaths"])
 
     def test_disabled_logging_is_carried_into_the_unit(self):
@@ -257,6 +265,182 @@ class GeneratedUnitTests(TempHomeCase, UnitSafetyChecks):
         self.assertIn(
             "Failed: systemctl daemon-reload: permission denied", buffer.getvalue()
         )
+
+
+class ServiceStateOwnershipTests(TempHomeCase):
+    """A root-owned database is unusable by the unprivileged unit (§ ownership).
+
+    ``ReadWritePaths=`` only relaxes systemd's filesystem sandbox.  Whatever a
+    privileged setup run creates still has to change hands, or the service
+    cannot open its own SQLite file.
+    """
+
+    def privileged(self):
+        """Pretend to be root without needing to be root."""
+        return mock.patch.object(cli, "can_change_ownership", return_value=True)
+
+    def recorder(self):
+        return mock.patch.object(
+            cli.target_user_mod, "apply_ownership", return_value=[]
+        )
+
+    def test_a_created_custom_database_is_handed_to_the_service_user(self):
+        db_path = self.root / "state" / "custom" / "events.sqlite3"
+        db = Database(db_path)
+        db.initialize()
+        with self.privileged(), self.recorder() as chown:
+            cli.adopt_state_ownership(db, self.target)
+        owned = {call.args[0] for call in chown.call_args_list}
+        self.assertIn(db_path, owned)
+        # Both directories this run had to create, not just the leaf.
+        self.assertIn(db_path.parent, owned)
+        self.assertIn(db_path.parent.parent, owned)
+        for call in chown.call_args_list:
+            self.assertIs(call.args[1], self.target)
+
+    def test_wal_sidecars_change_hands_with_the_database(self):
+        db_path = self.root / "state" / "events.sqlite3"
+        db = Database(db_path)
+        db.initialize()
+        Path(f"{db_path}-wal").write_text("")
+        with self.privileged(), self.recorder() as chown:
+            cli.adopt_state_ownership(db, self.target)
+        owned = {call.args[0] for call in chown.call_args_list}
+        self.assertIn(Path(f"{db_path}-wal"), owned)
+        # -shm does not exist, so it is not chowned into existence.
+        self.assertNotIn(Path(f"{db_path}-shm"), owned)
+
+    def test_a_pre_existing_directory_keeps_the_ownership_the_admin_gave_it(self):
+        existing = self.root / "already-there"
+        existing.mkdir()
+        db = Database(existing / "events.sqlite3")
+        db.initialize()
+        with self.privileged(), self.recorder() as chown:
+            cli.adopt_state_ownership(db, self.target)
+        owned = {call.args[0] for call in chown.call_args_list}
+        self.assertNotIn(existing, owned)
+        self.assertIn(db.path, owned)
+
+    def test_a_pre_existing_database_is_left_alone(self):
+        db = Database(self.root / "events.sqlite3")
+        db.initialize()
+        second = Database(db.path)
+        second.initialize()
+        with self.privileged(), self.recorder() as chown:
+            cli.adopt_state_ownership(second, self.target)
+        self.assertEqual(chown.call_args_list, [])
+
+    def test_nothing_is_chowned_when_the_process_is_not_privileged(self):
+        db = Database(self.root / "state" / "events.sqlite3")
+        db.initialize()
+        with (
+            mock.patch.object(cli, "can_change_ownership", return_value=False),
+            self.recorder() as chown,
+        ):
+            cli.adopt_state_ownership(db, self.target)
+        self.assertEqual(chown.call_args_list, [])
+
+    def test_a_root_target_needs_no_transfer(self):
+        db = Database(self.root / "state" / "events.sqlite3")
+        db.initialize()
+        root_target = TargetUserContext(
+            username="root", uid=0, gid=0, home=Path("/root")
+        )
+        with self.privileged(), self.recorder() as chown:
+            cli.adopt_state_ownership(db, root_target)
+        self.assertEqual(chown.call_args_list, [])
+
+
+class ServiceStateAccessTests(TempHomeCase):
+    def other_user(self) -> TargetUserContext:
+        """A service account that owns neither the database nor its directory."""
+        return TargetUserContext(
+            username="svc",
+            uid=os.getuid() + 4242,
+            gid=os.getgid() + 4242,
+            home=self.home,
+        )
+
+    def test_an_owned_writable_database_reports_no_problem(self):
+        self.assertIsNone(cli.service_state_access(self.db, self.target))
+
+    def test_a_database_owned_by_another_user_is_reported(self):
+        os.chmod(self.db.path, 0o600)
+        problem = cli.service_state_access(self.db, self.other_user())
+        self.assertIsNotNone(problem)
+        self.assertIn("not writable by svc", problem)
+
+    def test_an_unwritable_directory_is_reported(self):
+        directory = self.root / "locked"
+        directory.mkdir(mode=0o700)
+        db = Database(directory / "events.sqlite3")
+        db.initialize()
+        problem = cli.service_state_access(db, self.other_user())
+        self.assertIsNotNone(problem)
+        self.assertIn(str(directory), problem)
+
+    def enable_service(self, db: Database, *, state_dir=None):
+        """Run `install-systemd --enable` against ``db``; returns (code, output)."""
+        import contextlib
+        import io
+
+        platform = PlatformContext(
+            os_name="linux",
+            home=self.home,
+            windows_homes=[],
+            default_profiles=["linux-developer"],
+        )
+        ctx = cli.Context(
+            args=namespace(enable=True),
+            target=self.other_user(),
+            platform=platform,
+            db=db,
+            confirm=lambda _prompt: True,
+        )
+        patches = [
+            mock.patch.object(
+                cli, "SYSTEMD_UNIT_PATH", self.root / "honeypath.service"
+            ),
+            mock.patch.object(
+                cli.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ),
+        ]
+        if state_dir is not None:
+            patches.append(mock.patch.object(cli, "SYSTEMD_STATE_DIR", state_dir))
+        buffer = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            run = [stack.enter_context(p) for p in patches][1]
+            stack.enter_context(contextlib.redirect_stdout(buffer))
+            code = cli.cmd_install_systemd(ctx)
+        return code, buffer.getvalue(), run
+
+    def test_install_systemd_refuses_to_enable_an_unusable_database(self):
+        directory = self.root / "locked"
+        directory.mkdir(mode=0o700)
+        db = Database(directory / "events.sqlite3")
+        db.initialize()
+
+        code, output, run = self.enable_service(db)
+
+        self.assertEqual(code, 1)
+        run.assert_not_called()
+        self.assertIn("Not enabling", output)
+        self.assertIn("sudo chown", output)
+
+    def test_the_systemd_state_directory_is_left_to_systemd(self):
+        """StateDirectory= sets ownership at start, so do not second-guess it."""
+        directory = self.root / "state"
+        directory.mkdir(mode=0o700)
+        db = Database(directory / "events.sqlite3")
+        db.initialize()
+
+        code, output, run = self.enable_service(db, state_dir=directory)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("Not enabling", output)
 
 
 class CheckedInUnitTests(unittest.TestCase, UnitSafetyChecks):

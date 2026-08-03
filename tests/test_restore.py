@@ -161,16 +161,76 @@ class AlertFormatTests(unittest.TestCase):
                 "kind": "ssh_private_key",
                 "method": "win-audit",
                 "path": "C:/x/id_rsa",
-                "process_info": "C:\\evil.exe pid=42",
+                "process_info": "C:\\test.exe pid=42",
             }
         )
-        self.assertTrue(body.endswith("C:\\evil.exe pid=42"))
+        self.assertTrue(body.endswith("C:\\test.exe pid=42"))
 
-    def test_priority_by_severity(self):
-        self.assertEqual(alerts_mod.alert_priority("critical"), 1)
-        self.assertEqual(alerts_mod.alert_priority("high"), 0)
-        self.assertEqual(alerts_mod.alert_priority("medium"), -1)
-        self.assertEqual(alerts_mod.alert_priority(None), 0)
+
+class AlertPriorityTests(TempHomeCase):
+    """Every alert leaves at Pushover's normal priority.
+
+    A detection is either worth alerting on or it is not.  Grading delivery by
+    the canary's severity meant a real intrusion on a `medium` canary arrived
+    silently, so the severity now only labels the alert — it never decides how
+    loudly it lands.
+    """
+
+    def _payload_for(self, message: str) -> dict[str, list[str]]:
+        import urllib.parse
+        import urllib.request
+
+        token = self.root / "pushover-token"
+        user = self.root / "pushover-user"
+        token.write_text("azGDORePK8gMaC0QOYAMyEEuzJnyUi\n")
+        user.write_text("uQiRzpo4DXghDmr9QzzfQu27cmVRsG\n")
+        captured: dict[str, list[str]] = {}
+
+        class _Response:
+            def read(self):
+                return b'{"status":1}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def opener(request, timeout=None):
+            captured.update(urllib.parse.parse_qs(request.data.decode("ascii")))
+            return _Response()
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = opener
+        try:
+            sent, error = alerts_mod.Pushover(
+                token_file=token, user_file=user
+            ).send(message)
+        finally:
+            urllib.request.urlopen = original
+        self.assertTrue(sent, error)
+        return captured
+
+    def test_every_severity_is_sent_at_normal_priority(self):
+        for severity in ("critical", "high", "medium", None):
+            with self.subTest(severity=severity):
+                body = alerts_mod.format_alert(
+                    {
+                        "severity": severity,
+                        "kind": "ssh_private_key",
+                        "method": "inotify",
+                        "path": "/home/tester/.ssh/id_ed25519",
+                    }
+                )
+                self.assertEqual(self._payload_for(body)["priority"], ["0"])
+
+    def test_no_caller_can_reintroduce_a_per_alert_priority(self):
+        import inspect
+
+        params = inspect.signature(alerts_mod.Pushover.send).parameters
+        self.assertNotIn("priority", params)
+        self.assertFalse(hasattr(alerts_mod, "alert_priority"))
+        self.assertFalse(hasattr(alerts_mod, "SEVERITY_PRIORITY"))
 
 
 class PushoverCredentialTests(TempHomeCase):
@@ -204,7 +264,9 @@ class PushoverCredentialTests(TempHomeCase):
 
     def test_secure_store_uses_group_readable_non_world_readable_files(self):
         config_dir = self.root / "etc-honeypath"
-        with mock.patch.object(alerts_mod.os, "chown"):
+        # Ownership is applied through the directory descriptor, so this is the
+        # call an unprivileged test run cannot make.
+        with mock.patch.object(alerts_mod.os, "fchown"):
             token, user = alerts_mod.store_credentials(
                 "application-token",
                 "user-key",
@@ -396,14 +458,18 @@ class PushoverSecretContainmentTests(TempHomeCase):
         )
         self.db.set_meta("mute_until_epoch", "0")
         with self.db.connection() as conn:
+            # Enumerated from the schema rather than listed: a table added
+            # later would otherwise never be checked for leaked credentials.
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+            ]
             dumped = "\n".join(
                 str(row)
-                for table in (
-                    "events",
-                    "canaries",
-                    "managed_changes",
-                    "schema_metadata",
-                )
+                for table in tables
                 for row in conn.execute(f"SELECT * FROM {table}")
             )
         self.assertTrue(pushover.configured())

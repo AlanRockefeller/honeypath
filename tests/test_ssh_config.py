@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -268,15 +269,22 @@ class AssemblyTests(unittest.TestCase):
             identityfile_none_ok=True,
             allow_agent_forwarding=False,
         )
-        system = Path("/etc/ssh/ssh_config")
+        # A real /etc/ssh/ssh_config is not guaranteed to exist, and skipping
+        # the assertions when it does not made this test silently vacuous on
+        # exactly the hosts most likely to be misconfigured.
+        with tempfile.TemporaryDirectory() as tmp:
+            system = Path(tmp) / "system-ssh_config"
+            system.write_text("Host *\n    Compression no\n")
+            self._assert_include_is_last(block, system)
+
+    def _assert_include_is_last(self, block, system):
         text = ssh_canary.assemble_relocated_config(
             "Host work\n", block, system_config=system
         )
-        if system.exists():
-            self.assertIn(f"Include {system}", text)
-            self.assertGreater(
-                text.index(f"Include {system}"), text.index(ssh_canary.MANAGED_END)
-            )
+        self.assertIn(f"Include {system}", text)
+        self.assertGreater(
+            text.index(f"Include {system}"), text.index(ssh_canary.MANAGED_END)
+        )
 
     def test_system_include_omitted_when_absent(self):
         block, _ = ssh_canary.build_managed_block(

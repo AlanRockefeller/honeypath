@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from .support import TempHomeCase
@@ -40,6 +41,37 @@ class WslSignalTests(unittest.TestCase):
             self.assertIn(
                 pd.detect_os_name(), {pd.OS_LINUX, pd.OS_MACOS, pd.OS_UNKNOWN}
             )
+
+
+class DistroNameTests(unittest.TestCase):
+    def test_the_environment_wins_when_it_has_the_name(self):
+        self.assertEqual(
+            pd.wsl_distro_name({"WSL_DISTRO_NAME": "Ubuntu-22.04"}), "Ubuntu-22.04"
+        )
+
+    def test_an_ancestor_supplies_the_name_sudo_stripped(self):
+        # Every privileged Honeypath command runs under sudo, which clears
+        # WSL_DISTRO_NAME — the invoking shell still has it.
+        def fake_read_bytes(self):
+            if str(self) == "/proc/4242/environ":
+                return b"PATH=/usr/bin\0WSL_DISTRO_NAME=Ubuntu-22.04\0"
+            return b"PATH=/usr/bin\0"
+
+        with mock.patch.object(pd.Path, "read_bytes", fake_read_bytes), (
+            mock.patch.object(pd.os, "getppid", return_value=900)
+        ), mock.patch.object(pd, "_parent_pid", return_value=4242):
+            self.assertEqual(pd.wsl_distro_name({}), "Ubuntu-22.04")
+
+    def test_no_name_anywhere_is_reported_honestly(self):
+        with mock.patch.object(
+            pd.Path, "read_bytes", side_effect=OSError
+        ), mock.patch.object(pd.os, "getppid", return_value=900):
+            self.assertIsNone(pd.wsl_distro_name({}))
+
+    def test_a_comm_containing_parens_does_not_break_the_walk(self):
+        stat_line = "4242 (weird (name) proc) S 900 4242 0 0 -1 4194304 0"
+        with mock.patch.object(pd.Path, "read_text", return_value=stat_line):
+            self.assertEqual(pd._parent_pid(4242), 900)
 
 
 class WindowsHomeDetectionTests(TempHomeCase):
@@ -205,6 +237,8 @@ class MountTests(unittest.TestCase):
         self.assertFalse(pd.is_windows_filesystem(None))
 
     def test_read_mounts_returns_something_on_linux(self):
+        if not Path("/proc/mounts").exists():
+            self.skipTest("no /proc/mounts on this host")
         mounts = pd.read_mounts()
         self.assertTrue(any(m.mountpoint == "/" for m in mounts))
 

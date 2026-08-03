@@ -28,6 +28,7 @@ import errno
 import hashlib
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -55,6 +56,10 @@ from .target_user import (
 )
 
 RELOCATED_REL = ".local/share/honeypath/real-ssh"
+# How many parents up from the relocated directory the home directory sits.
+# Derived rather than written as a literal 3, so that changing RELOCATED_REL
+# cannot silently leave the anchor pointing partway down the path.
+_RELOCATED_HOME_PARENT = len(Path(RELOCATED_REL).parts) - 1
 BACKUP_ROOT_REL = ".local/share/honeypath/backups"
 WRAPPER_DIR_REL = "bin"
 
@@ -81,6 +86,24 @@ PHASE_RESTORED = "restored"
 
 SYSTEM_SSH_CONFIG = Path("/etc/ssh/ssh_config")
 SSH_BINARY = "/usr/bin/ssh"
+
+
+def resolve_ssh_binary(name: str = "ssh", *, exclude: Path | None = None) -> str:
+    """Locate the real ``ssh``/``scp``/``sftp`` on PATH.
+
+    The wrapper has to exec the genuine binary, and /usr/bin is only where it
+    usually lives — on Nix, Homebrew or a locally built OpenSSH it is not there
+    at all, and a wrapper pointing at a missing path breaks ssh outright.
+    ``exclude`` keeps Honeypath's own wrapper directory out of the search, so a
+    wrapper can never end up calling itself.
+    """
+    search = [
+        directory
+        for directory in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if directory and (exclude is None or Path(directory) != exclude)
+    ]
+    found = shutil.which(name, path=os.pathsep.join(search))
+    return found or SSH_BINARIES.get(name, SSH_BINARY)
 
 # Directives whose arguments are paths that must follow the relocation.
 REWRITE_DIRECTIVES = {
@@ -221,14 +244,15 @@ class Inventory:
         return {rel: entry.sha256 for rel, entry in self.entries.items()}
 
 
-def inventory_ssh_dir(
-    source: Path, *, allow_unsafe_symlinks: bool = False
-) -> Inventory:
+def inventory_ssh_dir(source: Path) -> Inventory:
     """Inventory ``~/.ssh`` without following symlinks out of the tree.
 
     Sockets, devices and FIFOs are refused outright: copying an agent socket
     or a device node is never what the user wants, and following a symlink
     out of the tree would drag unrelated files into the relocated directory.
+
+    Symlinks are always refused: the migration reads through anchored
+    descriptors and has no mode in which it follows one.
     """
     inventory = Inventory()
     try:
@@ -245,12 +269,9 @@ def inventory_ssh_dir(
                 inventory.refused.append(f"{rel} (unreadable: {exc})")
                 continue
             if stat.S_ISLNK(info.st_mode):
-                suffix = (
-                    "symlink; anchored migration never follows it"
-                    if not allow_unsafe_symlinks
-                    else "symlink; --allow-unsafe-symlinks cannot weaken anchored reads"
+                inventory.refused.append(
+                    f"{rel} (symlink; anchored migration never follows it)"
                 )
-                inventory.refused.append(f"{rel} ({suffix})")
                 continue
             if stat.S_ISDIR(info.st_mode):
                 inventory.directories.append(rel)
@@ -340,7 +361,8 @@ def sha256_text_bytes(content: bytes) -> str:
 # silently defeating every path rewrite.
 # ``config`` is generated.  authorized_keys* are sshd server-side state and
 # are restored separately; the client wrappers neither need nor use them.
-GENERATED_FILES = frozenset({"config", "authorized_keys", "authorized_keys2"})
+AUTHORIZED_KEYS_FILES = ("authorized_keys", "authorized_keys2")
+GENERATED_FILES = frozenset({"config", *AUTHORIZED_KEYS_FILES})
 
 
 @dataclass
@@ -367,8 +389,8 @@ def plan_copy(
         Path(root)
         if root is not None
         else (
-            destination.parents[3]
-            if len(destination.parents) > 3
+            destination.parents[_RELOCATED_HOME_PARENT]
+            if len(destination.parents) > _RELOCATED_HOME_PARENT
             else destination.parent
         )
     )
@@ -759,7 +781,9 @@ def discover_identity_files(directory: Path) -> list[Path]:
     )
     try:
         anchor = (
-            directory.parents[3] if len(directory.parents) > 3 else directory.parent
+            directory.parents[_RELOCATED_HOME_PARENT]
+            if len(directory.parents) > _RELOCATED_HOME_PARENT
+            else directory.parent
         )
         fd = safe_write.open_directory_nofollow(directory, root=anchor)
         try:
@@ -780,7 +804,7 @@ def discover_identity_files(directory: Path) -> list[Path]:
     return found
 
 
-def probe_identityfile_none(ssh_binary: str = SSH_BINARY) -> bool:
+def probe_identityfile_none(ssh_binary: str | None = None) -> bool:
     """Does this OpenSSH accept ``IdentityFile none``?
 
     Old releases reject it, in which case Honeypath falls back to an explicit
@@ -794,7 +818,7 @@ def probe_identityfile_none(ssh_binary: str = SSH_BINARY) -> bool:
         return False
     try:
         proc = subprocess.run(
-            [ssh_binary, "-G", "-F", probe_path, "probe.invalid"],
+            [ssh_binary or resolve_ssh_binary(), "-G", "-F", probe_path, "probe.invalid"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -952,9 +976,9 @@ def ssh_dash_g(
     *,
     config: Path | None = None,
     target: TargetUserContext | None = None,
-    ssh_binary: str = SSH_BINARY,
+    ssh_binary: str | None = None,
 ) -> tuple[bool, list[str], str]:
-    argv = [ssh_binary, "-G"]
+    argv = [ssh_binary or resolve_ssh_binary(), "-G"]
     if config is not None:
         argv += ["-F", str(config)]
     argv.append(host)
@@ -1074,8 +1098,11 @@ def install_wrappers(
             directory, target.home, mode=0o755, uid=target.uid, gid=target.gid
         )
 
-    for name, binary in SSH_BINARIES.items():
+    for name in SSH_BINARIES:
         path = directory / name
+        # Resolved now, not at import time: the wrapper records an absolute
+        # path and must record the one that exists on this host.
+        binary = resolve_ssh_binary(name, exclude=directory)
         content = wrapper_content(binary)
         digest = sha256_text(content)
         try:
@@ -1192,8 +1219,22 @@ def remove_wrappers(
 
 
 def path_contains_wrapper_dir(target: TargetUserContext) -> bool:
+    """Whether the target user's login shell puts the wrapper dir on PATH.
+
+    The question is about the shell the target user will type ``ssh`` into, not
+    about this process: under sudo ``os.environ["PATH"]`` is root's secure_path,
+    which answers "no" no matter what the user's rc files do.
+    """
     wanted = str(wrapper_dir(target.home))
-    return wanted in os.environ.get("PATH", "").split(os.pathsep)
+    try:
+        proc = run_as_target(
+            ["sh", "-lc", "printf %s \"$PATH\""], target, timeout=15
+        )
+    except (FileNotFoundError, PermissionError, subprocess.SubprocessError):
+        return wanted in os.environ.get("PATH", "").split(os.pathsep)
+    if proc.returncode != 0:
+        return wanted in os.environ.get("PATH", "").split(os.pathsep)
+    return wanted in proc.stdout.strip().split(os.pathsep)
 
 
 def rc_block_text() -> str:
@@ -1329,22 +1370,52 @@ def remove_rc_blocks(
 
 
 def _strip_rc_block(text: str) -> str:
-    out, skipping = [], False
+    out: list[str] = []
+    seams: list[int] = []
+    skipping = False
     for line in text.splitlines(keepends=True):
         if line.strip() == RC_BEGIN:
             skipping = True
             continue
         if line.strip() == RC_END:
             skipping = False
+            seams.append(len(out))
             continue
         if not skipping:
             out.append(line)
-    cleaned = "".join(out)
-    return re.sub(r"\n{3,}", "\n\n", cleaned)
+    # Only the join the removed block left behind is tidied.  Collapsing every
+    # run of blank lines in the file would reformat rc content the user wrote,
+    # in a file Honeypath is supposed to be leaving as it found it.
+    for seam in reversed(seams):
+        before = seam - 1
+        while before >= 0 and not out[before].strip():
+            before -= 1
+        after = seam
+        while after < len(out) and not out[after].strip():
+            after += 1
+        blanks = out[before + 1 : after]
+        # One blank line survives between surrounding content; none if the
+        # block sat at the very start or end of the file.
+        keep = blanks[:1] if before >= 0 and after < len(out) else []
+        out[before + 1 : after] = keep
+    return "".join(out)
+
+
+def git_installed(target: TargetUserContext) -> bool:
+    """Whether a git binary is runnable as the target user."""
+    try:
+        run_as_target(["git", "--version"], target)
+    except (FileNotFoundError, PermissionError):
+        return False
+    return True
 
 
 def git_ssh_command(target: TargetUserContext) -> str | None:
-    proc = run_as_target(["git", "config", "--global", "core.sshCommand"], target)
+    try:
+        proc = run_as_target(["git", "config", "--global", "core.sshCommand"], target)
+    except (FileNotFoundError, PermissionError):
+        # Git is optional.  Not having it is not a setup failure.
+        return None
     if proc.returncode != 0:
         return None
     value = proc.stdout.strip()
@@ -1362,6 +1433,9 @@ def set_git_ssh_command(
 ) -> bool:
     wrapper = wrapper_dir(target.home) / "ssh"
     desired = str(wrapper)
+    if not git_installed(target):
+        log("  git is not installed; nothing to point at the wrapper")
+        return True
     current = git_ssh_command(target)
 
     log(f"  current core.sshCommand: {current if current else '<unset>'}")
@@ -1407,6 +1481,12 @@ def restore_git_ssh_command(
         log("  no recorded core.sshCommand change")
         return
     change = changes[0]
+    if not git_installed(target):
+        # Git was removed after Honeypath pointed it at the wrapper.  There is
+        # nothing left to restore, and this must not abort the rest of the
+        # restore run.
+        log("  git is no longer installed; leaving the recorded change in place")
+        return
     current = git_ssh_command(target)
     desired = change.get("new_value")
     if current and desired and current != desired:
@@ -1603,18 +1683,26 @@ def list_backups(home: Path) -> list[Path]:
     fallback directly in the home.  Backups are never deleted by Honeypath;
     this only finds them.
     """
-    found: list[Path] = []
+    normal_prefix = "ssh-"
+    fallback_prefix = ".ssh.honeypath-backup."
+    found: list[tuple[str, Path]] = []
     root = backup_root(home)
     if root.is_dir():
-        found += [p for p in root.iterdir() if p.is_dir() and p.name.startswith("ssh-")]
+        found += [
+            (p.name[len(normal_prefix) :], p)
+            for p in root.iterdir()
+            if p.is_dir() and p.name.startswith(normal_prefix)
+        ]
     if home.is_dir():
         found += [
-            p
+            (p.name[len(fallback_prefix) :], p)
             for p in home.iterdir()
-            if p.is_dir() and p.name.startswith(".ssh.honeypath-backup.")
+            if p.is_dir() and p.name.startswith(fallback_prefix)
         ]
-    # The timestamp slug sorts lexicographically in chronological order.
-    return sorted(found, key=lambda p: (p.name.split("-", 1)[-1], str(p)))
+    # The timestamp slug sorts lexicographically in chronological order, but
+    # only once each name's own prefix is stripped: comparing whole names would
+    # rank every EXDEV fallback above every normal backup regardless of age.
+    return [p for _, p in sorted(found, key=lambda item: (item[0], str(item[1])))]
 
 
 def latest_valid_backup(home: Path) -> Path | None:
@@ -1703,7 +1791,8 @@ def prepare_relocated_config(
     else:
         none_ok = probe_identityfile_none()
         log(
-            f"  `IdentityFile none` accepted by {SSH_BINARY}: {'yes' if none_ok else 'no'}"
+            f"  `IdentityFile none` accepted by {resolve_ssh_binary()}: "
+            f"{'yes' if none_ok else 'no'}"
         )
 
     managed, block_warnings = build_managed_block(
@@ -1861,13 +1950,15 @@ def known_hosts_seed(target: TargetUserContext, log=print) -> None:
 
 def authorized_keys_warning(home: Path) -> list[str]:
     """Loud warnings when ~/.ssh holds server-side state."""
-    path = home / ".ssh" / "authorized_keys"
-    if not path.exists():
+    ssh_dir = home / ".ssh"
+    present = [name for name in AUTHORIZED_KEYS_FILES if (ssh_dir / name).exists()]
+    if not present:
         return []
+    named = " and ".join(present)
     lines = [
-        "!!  ~/.ssh/authorized_keys exists — this directory holds SERVER-side state.",
+        f"!!  ~/.ssh/{named} exists — this directory holds SERVER-side state.",
         "!!  Moving it would break inbound SSH logins to this machine.",
-        "!!  Honeypath copies authorized_keys back into the new ~/.ssh by default",
+        f"!!  Honeypath copies {named} back into the new ~/.ssh by default",
         "!!  (it is public material, and sshd reads are routine, so it is not a canary).",
         "!!  Use --no-authorized-keys to opt out.",
     ]
@@ -2022,7 +2113,11 @@ def activate(
         log(f"  [dry-run] rename {source} -> {backup}")
         log(
             f"  [dry-run] create a fresh {source} (0700) with canaries: "
-            + ", ".join(e.relative_path.split("/", 1)[1] for e in ssh_entries())
+            # Same argument as the real creation path below, so the preview
+            # cannot drift from what activation actually plants.
+            + ", ".join(
+                e.relative_path.split("/", 1)[1] for e in ssh_entries(PLATFORM_LINUX)
+            )
         )
         return True, backup
 
@@ -2155,9 +2250,9 @@ def activate(
                 }
             )
 
-        authorized_change = None
+        authorized_changes: list[dict] = []
         if keep_authorized_keys:
-            authorized_change = _restore_authorized_keys(
+            authorized_changes = _restore_authorized_keys(
                 backup, source, target, log=log
             )
 
@@ -2166,7 +2261,7 @@ def activate(
             backup_path=str(backup),
             activated_at=utc_now(),
             canaries=manifest,
-            authorized_change=authorized_change,
+            authorized_changes=authorized_changes,
         )
     except Exception as exc:
         log(f"FAILED: SSH activation did not complete: {exc}")
@@ -2217,15 +2312,37 @@ def _restore_authorized_keys(
     target: TargetUserContext,
     *,
     log=print,
+) -> list[dict]:
+    """Copy every server-side authorized-keys file back into the new ~/.ssh.
+
+    Both names are in GENERATED_FILES, so neither is migrated to the relocated
+    directory.  Restoring only ``authorized_keys`` would therefore silently
+    discard a configured ``authorized_keys2``.
+    """
+    changes: list[dict] = []
+    for name in AUTHORIZED_KEYS_FILES:
+        change = _restore_one_authorized_keys(backup, ssh_dir, target, name, log=log)
+        if change is not None:
+            changes.append(change)
+    return changes
+
+
+def _restore_one_authorized_keys(
+    backup: Path,
+    ssh_dir: Path,
+    target: TargetUserContext,
+    name: str,
+    *,
+    log=print,
 ) -> dict | None:
-    source = backup / "authorized_keys"
+    source = backup / name
     try:
         source_info = safe_write.stat_nofollow(source, root=backup)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(source_info.st_mode):
-        raise SSHCanaryError("authorized_keys in the backup is not a regular file")
-    destination = ssh_dir / "authorized_keys"
+        raise SSHCanaryError(f"{name} in the backup is not a regular file")
+    destination = ssh_dir / name
     try:
         # fsync'd: losing this file silently breaks inbound SSH logins.
         for warning in safe_write.atomic_copy(
@@ -2239,16 +2356,14 @@ def _restore_authorized_keys(
             fsync_data=True,
             replace=False,
         ):
-            raise SSHCanaryError(
-                f"authorized_keys metadata/durability failure: {warning}"
-            )
+            raise SSHCanaryError(f"{name} metadata/durability failure: {warning}")
     except (OSError, safe_write.SafeWriteError) as exc:
-        raise SSHCanaryError(f"could not restore authorized_keys: {exc}") from None
+        raise SSHCanaryError(f"could not restore {name}: {exc}") from None
     destination_info = safe_write.stat_nofollow(destination, root=target.home)
     source_hash = safe_write.sha256_anchored(source, root=backup)
     if safe_write.sha256_anchored(destination, root=target.home) != source_hash:
-        raise SSHCanaryError("authorized_keys verification failed after restoration")
-    log(f"  preserved authorized_keys (from {source}) — not registered as a canary")
+        raise SSHCanaryError(f"{name} verification failed after restoration")
+    log(f"  preserved {name} (from {source}) — not registered as a canary")
     return {
         "target": str(destination),
         "source": str(source),

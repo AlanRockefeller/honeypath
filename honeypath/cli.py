@@ -8,11 +8,13 @@ import grp
 import os
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,12 +22,17 @@ from . import VERSION, alerts as alerts_mod
 from . import catalog as catalog_mod
 from . import eventlog
 from . import safe_write
-from . import ssh_canary, windows_audit
+from . import ssh_canary, target_user as target_user_mod, windows_audit
 from .database import DEFAULT_DB_PATH, Database
+from . import monitor as monitor_mod
 from .monitor import (
     DEFAULT_COOLDOWN,
     DEFAULT_DEDUP_WINDOW,
     DEFAULT_POLL_INTERVAL,
+    DEFAULT_SWEEP_THRESHOLD,
+    DEFAULT_SWEEP_WINDOW,
+    DEFAULT_WINDOWS_ATIME,
+    WINDOWS_ATIME_MODES,
     InotifyWatcher,
     Monitor,
 )
@@ -41,7 +48,14 @@ from .platform_detect import (
     read_mounts,
     wsl_signals,
 )
-from .target_user import TargetUserError, resolve_target_user
+from .target_user import (
+    MODE_DIR_PRIVATE,
+    MODE_FILE_PRIVATE,
+    TargetUserContext,
+    TargetUserError,
+    can_change_ownership,
+    resolve_target_user,
+)
 
 SSH_GATE_MESSAGE = (
     "SSH canaries skipped: setup-ssh-canary --activate has not been completed"
@@ -86,6 +100,9 @@ class Context:
     db: Database
     confirm: object
     log_path: Path | None = None
+    # Set by build_plan() and consumed by cmd_create_canaries() when
+    # --canarytoken-aws-file spliced real Canarytokens material into the plan.
+    canarytoken: dict | None = None
 
     def open_event_log(self):
         """Open the operations log, or a no-op log for dry runs.
@@ -144,11 +161,12 @@ def build_context(args: argparse.Namespace, *, initialize_db: bool = True) -> Co
     if initialize_db and not dry_run:
         try:
             db.initialize()
-        except (OSError, Exception) as exc:  # sqlite3.OperationalError et al.
+        except (OSError, sqlite3.OperationalError) as exc:
             raise SystemExit(
                 f"cannot open the Honeypath database at {db.path}: {exc}\n"
                 "Run under sudo, or pass --db <path> to use a different location."
-            )
+            ) from exc
+        adopt_state_ownership(db, target)
     return Context(
         args=args,
         target=target,
@@ -157,6 +175,76 @@ def build_context(args: argparse.Namespace, *, initialize_db: bool = True) -> Co
         confirm=make_confirm(bool(_merged(args, "yes", False))),
         log_path=resolve_log_path(args, db_path),
     )
+
+
+def adopt_state_ownership(db: Database, target: TargetUserContext) -> list[str]:
+    """Give the target user the state this privileged run just created.
+
+    Honeypath is routinely set up under ``sudo`` but *runs* as the target user:
+    the systemd unit sets ``User=`` to that account, and every later
+    unprivileged command opens the same database.  Anything created as root
+    therefore has to change hands here.  The default ``/var/lib/honeypath`` is
+    handled by ``StateDirectory=`` too, but a custom ``--db`` has no systemd
+    equivalent — ``ReadWritePaths=`` only relaxes the sandbox, it does not make
+    a root-owned SQLite file writable — so without this the generated service
+    cannot open its own database.
+
+    Only what this process brought into existence is touched.  A ``--db``
+    pointed into a pre-existing directory leaves that directory's ownership
+    exactly as the administrator set it.
+    """
+    if not can_change_ownership() or target.is_root:
+        return []
+    problems: list[str] = []
+    for directory in db.created_directories:
+        problems += target_user_mod.apply_ownership(
+            directory, target, mode=MODE_DIR_PRIVATE, best_effort=True
+        )
+    if not db.created_database:
+        return problems
+    for path in db.state_paths():
+        if not path.exists():
+            continue
+        problems += target_user_mod.apply_ownership(
+            path, target, mode=MODE_FILE_PRIVATE, best_effort=True
+        )
+    return problems
+
+
+def service_state_access(db: Database, target: TargetUserContext) -> str | None:
+    """Explain why the unprivileged service user could not use ``db``, if so.
+
+    The unit runs as ``target``; SQLite in WAL mode needs to write the database
+    *and* create sidecars next to it, so the containing directory matters as
+    much as the file.  Returns ``None`` when both are usable.
+    """
+
+    def permitted(info: os.stat_result, bits: tuple[int, int, int]) -> bool:
+        owner_bit, group_bit, other_bit = bits
+        if info.st_uid == target.uid:
+            return bool(info.st_mode & owner_bit)
+        if info.st_gid == target.gid:
+            return bool(info.st_mode & group_bit)
+        return bool(info.st_mode & other_bit)
+
+    write = (stat.S_IWUSR, stat.S_IWGRP, stat.S_IWOTH)
+    execute = (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)
+    try:
+        directory = db.path.parent.stat()
+    except OSError as exc:
+        return f"{db.path.parent}: {exc}"
+    if not permitted(directory, write) or not permitted(directory, execute):
+        return f"{db.path.parent} is not writable by {target.username}"
+    for path in db.state_paths():
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"{path}: {exc}"
+        if not permitted(info, write):
+            return f"{path} is not writable by {target.username}"
+    return None
 
 
 def resolve_log_path(args: argparse.Namespace, db_path: Path) -> Path | None:
@@ -198,16 +286,17 @@ def refresh_is_permitted(
 ) -> tuple[bool, str]:
     """Decide whether ``--refresh-managed`` may replace ``path``.
 
-    All five conditions must hold, and each is checked independently:
+    All four conditions must hold, and each is checked independently:
 
     1. the exact path is recorded in SQLite as Honeypath-managed;
     2. the path on disk is a regular file — never a symlink, directory, FIFO,
        socket or device node;
     3. its contents carry the Honeypath marker;
     4. the resolved destination is still inside the approved home root, with
-       no symlinked parent component;
-    5. consequently, a credential file Honeypath did not write can never be
-       selected.
+       no symlinked parent component.
+
+    Together these mean a credential file Honeypath did not write can never be
+    selected: being recorded in the database is not on its own enough.
 
     Returns ``(permitted, reason)``; ``reason`` explains a refusal.
     """
@@ -282,7 +371,7 @@ def build_plan(ctx: Context) -> tuple[list[PlanItem], list[str], list[str]]:
                 "Existing .aws/credentials canaries are left alone; pass "
                 "--refresh-managed to update ones Honeypath created."
             )
-    ctx.canarytoken = canarytoken  # type: ignore[attr-defined]
+    ctx.canarytoken = canarytoken
 
     items: list[PlanItem] = []
     ssh_gate_reported = False
@@ -419,7 +508,17 @@ def windows_read_test(windows_home: Path, log=print) -> None:
         return
     probe = windows_home / f".honeypath-readtest-{int(time.time())}"
     try:
-        probe.write_text("honeypath windows read test\n")
+        # O_EXCL|O_NOFOLLOW: the probe name is predictable, so never write
+        # through a symlink or into a file someone else pre-created.
+        fd = os.open(
+            probe,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, b"honeypath windows read test\n")
+        finally:
+            os.close(fd)
     except OSError as exc:
         log(f"  cannot create {probe}: {exc}")
         return
@@ -541,8 +640,8 @@ def cmd_doctor(ctx: Context) -> int:
         f"inotifywait:         {inotify or 'NOT INSTALLED (apt install inotify-tools)'}"
     )
     print(
-        f"ssh binary:          {ssh_canary.SSH_BINARY} "
-        f"({'present' if Path(ssh_canary.SSH_BINARY).exists() else 'MISSING'})"
+        f"ssh binary:          {(ssh_bin := ssh_canary.resolve_ssh_binary())} "
+        f"({'present' if Path(ssh_bin).exists() else 'MISSING'})"
     )
     print(f"git:                 {shutil.which('git') or 'not found'}")
 
@@ -796,6 +895,14 @@ FORCE_REJECTED_MESSAGE = (
 )
 
 
+def relaunch_extra(ctx: Context) -> list[str]:
+    """Flags an elevated re-run must inherit to target the same user and db."""
+    extra = ["--user", ctx.target.username]
+    if str(ctx.db.path) != str(DEFAULT_DB_PATH):
+        extra += ["--db", str(ctx.db.path)]
+    return extra
+
+
 def reject_force(ctx: Context) -> bool:
     """True when --force was supplied to a command that must never accept it."""
     return bool(_merged(ctx.args, "force", False))
@@ -808,6 +915,69 @@ def cmd_plan(ctx: Context) -> int:
     items, profiles, notes = build_plan(ctx)
     _print_plan(ctx, items, profiles, notes)
     return 0
+
+
+class RegistrationRejected(safe_write.InstallHookError):
+    """A canary reached disk but could not be verified or recorded.
+
+    Raised from inside the write so ``safe_write`` undoes it: the previous file
+    is put back, or a brand-new one is removed.  Not a ``SafeWriteError`` —
+    the filesystem did its job, Honeypath declined the result.
+    """
+
+
+def register_installed_canary(
+    ctx: Context, item: PlanItem, content: str, root: Path
+) -> Callable[[], None]:
+    """Build the hook that verifies and records one canary before it commits.
+
+    Everything here runs while the write can still be rolled back, so the
+    manifest row and the file on disk move together.  Without that, a refresh
+    whose registration fails leaves the new file behind under a row still
+    describing the old hash and inode: the next watch reports the canary as
+    replaced, and every later ``--refresh-managed`` refuses it because its
+    content no longer matches what was recorded.
+    """
+    expected_hash = catalog_mod.sha256_text(content)
+
+    def register() -> None:
+        try:
+            # Hash through one anchored descriptor, then capture metadata
+            # from that same descriptor *after* the verification read.
+            # Recording the pre-read atime makes our own verification look
+            # like an attacker read on the first watch polling pass.
+            verify_fd = safe_write.open_regular_nofollow(item.path, root=root)
+            try:
+                disk_hash = safe_write.sha256_fd(verify_fd)
+                disk_info = os.fstat(verify_fd)
+            finally:
+                os.close(verify_fd)
+        except (OSError, safe_write.SafeWriteError) as exc:
+            raise RegistrationRejected(
+                f"failed verification after write: {exc}"
+            ) from exc
+        if disk_hash != expected_hash or not stat.S_ISREG(disk_info.st_mode):
+            raise RegistrationRejected("failed exact identity verification after write")
+        try:
+            ctx.db.record_canary(
+                canary_id=item.entry.key,
+                path=str(item.path),
+                kind=item.entry.kind,
+                severity=item.entry.severity,
+                profile=item.entry.profile,
+                platform=item.entry.platform,
+                intrusiveness=item.entry.intrusiveness,
+                baseline_atime=disk_info.st_atime_ns,
+                active=1,
+                content_hash=expected_hash,
+                managed_marker=catalog_mod.managed_marker(item.entry.key),
+                file_dev=disk_info.st_dev,
+                file_ino=disk_info.st_ino,
+            )
+        except Exception as exc:
+            raise RegistrationRejected(f"database registration failed: {exc}") from exc
+
+    return register
 
 
 def cmd_create_canaries(ctx: Context) -> int:
@@ -852,7 +1022,7 @@ def cmd_create_canaries(ctx: Context) -> int:
             print(f"  {line}")
 
     heading("Creating")
-    canarytoken = getattr(ctx, "canarytoken", None)
+    canarytoken = ctx.canarytoken
     created_count = 0
     refreshed_count = 0
     registered_count = 0
@@ -877,75 +1047,36 @@ def cmd_create_canaries(ctx: Context) -> int:
         existing_row = (
             ctx.db.get_canary_by_path(str(item.path)) if replace_managed else None
         )
-        outcome = catalog_mod.create_canary_file(
-            item.path,
-            content,
-            item.entry.mode,
-            ctx.target,
-            replace_managed=replace_managed,
-            best_effort=best_effort,
-            root=root,
-            expected_content_hash=existing_row.content_hash if existing_row else None,
-        )
+        try:
+            outcome = catalog_mod.create_canary_file(
+                item.path,
+                content,
+                item.entry.mode,
+                ctx.target,
+                replace_managed=replace_managed,
+                best_effort=best_effort,
+                root=root,
+                expected_content_hash=(
+                    existing_row.content_hash if existing_row else None
+                ),
+                # Verification and manifest registration happen inside the
+                # write, while it can still be undone.  A refresh that cannot
+                # be recorded therefore leaves the previous canary in place
+                # instead of a file whose hash and inode no longer match the
+                # row describing it.
+                on_installed=register_installed_canary(ctx, item, content, root),
+            )
+        except safe_write.RollbackError as exc:
+            print(f"  {exc}")
+            problems.append(f"{item.path}: {exc}")
+            skipped_count += 1
+            continue
+        except RegistrationRejected as exc:
+            print(f"  {exc}: {item.path}")
+            print("  the write was undone; nothing was registered")
+            skipped_count += 1
+            continue
         if outcome.created:
-            try:
-                # Hash through one anchored descriptor, then capture metadata
-                # from that same descriptor *after* the verification read.
-                # Recording the pre-read atime makes our own verification look
-                # like an attacker read on the first watch polling pass.
-                verify_fd = safe_write.open_regular_nofollow(item.path, root=root)
-                try:
-                    disk_hash = safe_write.sha256_fd(verify_fd)
-                    disk_info = os.fstat(verify_fd)
-                finally:
-                    os.close(verify_fd)
-                baseline = disk_info.st_atime_ns
-            except (OSError, safe_write.SafeWriteError) as exc:
-                print(f"  failed verification after write: {item.path}: {exc}")
-                skipped_count += 1
-                continue
-            expected_hash = catalog_mod.sha256_text(content)
-            if disk_hash != expected_hash or not stat.S_ISREG(disk_info.st_mode):
-                print(f"  failed exact identity verification after write: {item.path}")
-                skipped_count += 1
-                continue
-            try:
-                ctx.db.record_canary(
-                    canary_id=item.entry.key,
-                    path=str(item.path),
-                    kind=item.entry.kind,
-                    severity=item.entry.severity,
-                    profile=item.entry.profile,
-                    platform=item.entry.platform,
-                    intrusiveness=item.entry.intrusiveness,
-                    baseline_atime=baseline,
-                    active=1,
-                    content_hash=expected_hash,
-                    managed_marker=catalog_mod.managed_marker(item.entry.key),
-                    file_dev=disk_info.st_dev,
-                    file_ino=disk_info.st_ino,
-                )
-            except Exception as exc:
-                print(f"  database registration failed for {item.path}: {exc}")
-                if item.action == "create":
-                    try:
-                        safe_write.unlink_regular_if_hash(
-                            item.path,
-                            root=root,
-                            expected_sha256=expected_hash,
-                            expected_dev=disk_info.st_dev,
-                            expected_ino=disk_info.st_ino,
-                        )
-                        print(
-                            "  removed the exact unregistered canary created by this run"
-                        )
-                    except Exception as cleanup_exc:
-                        print(
-                            "  FATAL: could not safely remove the unregistered canary: "
-                            f"{cleanup_exc}"
-                        )
-                skipped_count += 1
-                continue
             if item.action == "refresh":
                 refreshed_count += 1
                 print(f"  refreshed {item.path}")
@@ -971,22 +1102,30 @@ def cmd_create_canaries(ctx: Context) -> int:
             skipped_count += 1
             print(f"  skipped watch-only replacement {item.path}: {exc}")
             continue
-        ctx.db.record_canary(
-            canary_id=item.entry.key,
-            path=str(item.path),
-            kind=item.entry.kind,
-            severity=item.entry.severity,
-            profile=item.entry.profile,
-            platform=item.entry.platform,
-            intrusiveness=item.entry.intrusiveness,
-            baseline_atime=baseline,
-            active=1,
-            content_hash=None,
-            managed_marker=None,
-            file_dev=info.st_dev,
-            file_ino=info.st_ino,
-            managed_by="watch-only",
-        )
+        try:
+            ctx.db.record_canary(
+                canary_id=item.entry.key,
+                path=str(item.path),
+                kind=item.entry.kind,
+                severity=item.entry.severity,
+                profile=item.entry.profile,
+                platform=item.entry.platform,
+                intrusiveness=item.entry.intrusiveness,
+                baseline_atime=baseline,
+                active=1,
+                content_hash=None,
+                managed_marker=None,
+                file_dev=info.st_dev,
+                file_ino=info.st_ino,
+                managed_by="watch-only",
+            )
+        except Exception as exc:
+            # One unregisterable path must not abandon the rest, exactly as in
+            # the creation loop above.
+            print(f"  database registration failed: {exc}: {item.path}")
+            problems.append(f"{item.path}: database registration failed: {exc}")
+            skipped_count += 1
+            continue
         registered_count += 1
         print(f"  registered for watching (not created): {item.path}")
 
@@ -1064,6 +1203,28 @@ def cmd_watch(ctx: Context) -> int:
     elif event_log.path is not None:
         print(f"Logging to {event_log.path}")
 
+    allowlist = windows_audit.ProcessAllowlist(
+        list(getattr(args, "allow_process", None) or [])
+        + (
+            list(windows_audit.KNOWN_SCANNER_PROCESSES)
+            if getattr(args, "allow_known_scanners", False)
+            else []
+        )
+    )
+    if allowlist:
+        # Printed and logged every session, on purpose.  An allowlist is a
+        # deliberate blind spot and nobody should have to remember it is there.
+        print(
+            f"Allowlisted processes (recorded, never alerted): {len(allowlist.patterns)}"
+        )
+        for pattern in allowlist.patterns:
+            print(f"  {pattern}")
+        event_log.warn(
+            "Windows process allowlist active; reads by "
+            + ", ".join(allowlist.patterns)
+            + " will be recorded but not delivered"
+        )
+
     win_watcher = None
     if ctx.platform.os_name == OS_WSL:
         windows_canaries = [c for c in canaries if c.platform == "windows"]
@@ -1072,7 +1233,10 @@ def cmd_watch(ctx: Context) -> int:
         )
         if windows_canaries and recorded_sacls and interop_available():
             win_watcher = windows_audit.WinAuditWatcher(
-                ctx.db, windows_canaries, interval=float(args.win_audit_interval)
+                ctx.db,
+                windows_canaries,
+                interval=float(args.win_audit_interval),
+                allowlist=allowlist,
             )
         elif windows_canaries and not recorded_sacls:
             print("Note: Windows canaries are recorded but Windows auditing is not set")
@@ -1107,6 +1271,20 @@ def cmd_watch(ctx: Context) -> int:
             "alerts are MUTED; detections will be recorded but not delivered"
         )
 
+    windows_atime = getattr(args, "windows_atime", monitor_mod.DEFAULT_WINDOWS_ATIME)
+    if any(c.platform == "windows" for c in canaries) and not args.no_atime:
+        if windows_atime == monitor_mod.WINDOWS_ATIME_LOG:
+            print("Note: Windows canary atime hits are recorded but not alerted on")
+            print("      (--windows-atime=alert restores delivery). NTFS last-access")
+            print("      times move for any backup or indexing pass and name no")
+            print("      process; SACL auditing is what detects Windows-side reads.")
+        elif windows_atime == monitor_mod.WINDOWS_ATIME_OFF:
+            print("Note: Windows canary atime reads are not being detected at all")
+            print("      (--windows-atime=off). Removal and replacement still are.")
+            event_log.warn(
+                "Windows canary atime read detection is disabled (--windows-atime=off)"
+            )
+
     monitor = Monitor(
         ctx.db,
         canaries,
@@ -1117,6 +1295,14 @@ def cmd_watch(ctx: Context) -> int:
         enable_atime=not args.no_atime,
         win_audit_watcher=win_watcher,
         rearm=not args.no_rearm,
+        windows_atime=windows_atime,
+        attribute_readers=not getattr(args, "no_attribution", False),
+        sweep_window=float(
+            getattr(args, "sweep_window", monitor_mod.DEFAULT_SWEEP_WINDOW)
+        ),
+        sweep_threshold=int(
+            getattr(args, "sweep_threshold", monitor_mod.DEFAULT_SWEEP_THRESHOLD)
+        ),
         event_log=event_log,
     )
 
@@ -1160,7 +1346,8 @@ def cmd_watch(ctx: Context) -> int:
         counts = monitor.counts
         summary = (
             f"events logged: {counts['events']}, alerts sent: {counts['alerts']}, "
-            f"cooldown-suppressed: {counts['suppressed']}, muted: {counts['muted']}"
+            f"cooldown-suppressed: {counts['suppressed']}, muted: {counts['muted']}, "
+            f"advisory: {counts['advisory']}, summarised into sweeps: {counts['swept']}"
         )
         print(f"\n{summary}")
         event_log.info(f"watch stopped — {summary}")
@@ -1329,24 +1516,37 @@ def cmd_setup(ctx: Context) -> int:
         if windows_count:
             heading("Windows-side detection")
             print(f"  {windows_count} Windows-home canaries were created.")
-            if windows_audit.is_elevated():
-                if ctx.confirm("Configure Windows Security auditing for them now?"):
-                    code = windows_audit.setup_windows_audit(
-                        ctx.db, dry_run=False, confirm=ctx.confirm
-                    )
-                    if code != 0:
-                        print(
-                            "Windows auditing was not enabled; Linux-side "
-                            "monitoring remains usable."
-                        )
-            else:
+            if not windows_audit.is_elevated():
                 print(
                     "  WSL-side reads are monitored best-effort; DrvFS can miss access"
                 )
-                print("  events. Reliable Windows-home detection requires Windows")
-                print("  administrator privileges; setup-windows-audit explains the")
-                print("  elevated PowerShell/WSL command when you are ready.")
+                print("  events. Reliable Windows-home detection needs Windows")
+                print("  administrator rights, which Honeypath can request with a")
+                print("  UAC prompt — it re-runs this one step in an elevated console.")
+            if ctx.confirm("Configure Windows Security auditing for them now?"):
+                code = windows_audit.setup_windows_audit(
+                    ctx.db,
+                    dry_run=False,
+                    confirm=ctx.confirm,
+                    relaunch_extra=relaunch_extra(ctx),
+                )
+                if code == windows_audit.EXIT_HANDED_OFF:
+                    print(
+                        "Guided setup continues here; the elevated console finishes "
+                        "the Windows side."
+                    )
+                elif code != 0:
+                    print(
+                        "Windows auditing was not enabled; Linux-side "
+                        "monitoring remains usable."
+                    )
+            else:
+                print(
+                    "  Skipped; run `sudo python3 honeypath.py setup-windows-audit` "
+                    "later."
+                )
 
+    ssh_prepared = False
     heading("SSH canary (optional, two phases)")
     print("  Phase 1 copies your SSH client state to Honeypath-managed storage and")
     print("  installs ssh/scp/sftp wrappers. It does not replace ~/.ssh yet.")
@@ -1356,6 +1556,7 @@ def cmd_setup(ctx: Context) -> int:
         if code != 0:
             print("Guided setup stopped; the SSH canary was not prepared.")
             return code
+        ssh_prepared = True
     else:
         print(
             "  SSH canary skipped; run "
@@ -1363,20 +1564,57 @@ def cmd_setup(ctx: Context) -> int:
         )
 
     heading("Run continuously")
+    running_as_service = False
     if shutil.which("systemctl") and Path("/run/systemd/system").exists():
         if ctx.confirm("Install, enable, and start the Honeypath systemd service?"):
             ctx.args.enable = True
             code = cmd_install_systemd(ctx)
             if code != 0:
                 return code
-            print("\nGuided setup complete; Honeypath is running as a service.")
-            return 0
+            running_as_service = True
     else:
         print("  systemd is not active in this WSL distribution.")
 
-    print("Guided setup complete. Start monitoring with:")
-    print("  sudo python3 honeypath.py watch")
+    if running_as_service:
+        print("\nGuided setup complete; Honeypath is running as a service.")
+    else:
+        print("\nGuided setup complete. Start monitoring with:")
+        print("  sudo python3 honeypath.py watch")
+
+    # Phase 1 leaves an unfinished job behind, so the wizard must not end
+    # without saying what "finished" looks like and how to get there.
+    if ssh_prepared:
+        _print_ssh_completion_steps(ctx)
     return 0
+
+
+def _print_ssh_completion_steps(ctx: Context) -> None:
+    """Close the loop on SSH Phase 1: what to test, and how to finish."""
+    heading("Unfinished: the SSH canary is prepared, not active")
+    print("  ~/.ssh is untouched and no SSH canary exists yet. Real SSH keys still")
+    print("  live in ~/.ssh, so an attacker reading them would not be detected.")
+    print("  Activation is a separate command you run once you trust the wrappers.")
+
+    print("\n  1. Test the wrappers. None of these needs to reach a real host —")
+    print("     example.invalid never resolves, so a DNS failure is a PASS. What")
+    print("     they verify is which binary and which config got selected:\n")
+    for command in ssh_canary.PHASE1_TEST_COMMANDS:
+        print(f"       {command}")
+    print()
+    for line in ssh_canary.PHASE1_TEST_NOTES:
+        print(f"     {line}")
+
+    print("\n  2. When every check looks right (days later is fine), activate:")
+    print("       sudo python3 honeypath.py setup-ssh-canary --activate")
+    print("     That transactionally backs up ~/.ssh and replaces it with canaries.")
+    print("     Until then, `watch` reports the SSH canaries as not yet active.")
+
+    print("\n  What activation will break, on purpose:")
+    for line in ssh_canary.DIRECT_SSH_WARNING:
+        print(f"     {line}" if line else "")
+
+    print("\n  Check state at any time:  sudo python3 honeypath.py ssh-status")
+    print("  Undo Phase 1 or Phase 2:  sudo python3 honeypath.py restore-ssh-canary")
 
 
 def cmd_test_alert(ctx: Context) -> int:
@@ -1458,7 +1696,7 @@ Type=simple
 # anyone who can edit {entry_dir} obtain root at the next restart.
 User={user}
 Group={group}
-ExecStart={python} {entry} --user {user} --db {db}{log_option} watch
+ExecStart="{python}" "{entry}" --user "{user}" --db "{db}"{log_option} watch
 Restart=on-failure
 RestartSec=10
 
@@ -1506,7 +1744,7 @@ def systemd_unit_text(ctx: Context) -> str:
         log_option = " --no-log-file"
     elif _merged(ctx.args, "log_file"):
         log_path = Path(_merged(ctx.args, "log_file")).expanduser()
-        log_option = f" --log-file {log_path}"
+        log_option = f' --log-file "{log_path}"'
         if log_path.parent != db_dir:
             log_dir = log_path.parent
     if db_dir == SYSTEMD_STATE_DIR and log_dir is None:
@@ -1561,6 +1799,10 @@ def _credential_permission_lines(user: str, group: str) -> list[str]:
         f"  or owned outright by {user}:",
         f"    sudo chown {user}:{group} {alerts_mod.TOKEN_FILE} {alerts_mod.USER_FILE}",
         f"    sudo chmod 0600 {alerts_mod.TOKEN_FILE} {alerts_mod.USER_FILE}",
+        # Owning the files is not enough: without search permission on the
+        # directory the service still cannot reach them.
+        f"    sudo chown root:{group} {alerts_mod.CONFIG_DIR}",
+        f"    sudo chmod 0750 {alerts_mod.CONFIG_DIR}",
         "",
         "Never chmod these files 0644. `doctor` flags a world-readable credential.",
     ]
@@ -1653,6 +1895,28 @@ def cmd_install_systemd(ctx: Context) -> int:
         for line in _credential_permission_lines(ctx.target.username, group):
             print(f"  {line}")
 
+    # ReadWritePaths= only relaxes systemd's sandbox; it cannot make a file the
+    # service user does not own writable.  Say so before the unit is enabled,
+    # rather than letting the service fail to open SQLite at first start.  The
+    # default location is exempt: there systemd owns the directory's lifecycle
+    # through StateDirectory= and sets it up for the service user at start.
+    custom_state = ctx.db.path.parent != SYSTEMD_STATE_DIR
+    state_problem = (
+        service_state_access(ctx.db, ctx.target)
+        if custom_state and not ctx.dry_run
+        else None
+    )
+    if state_problem is not None:
+        heading("Database is not usable by the service user")
+        print(f"  {state_problem}")
+        print(f"  The unit runs as {ctx.target.username}, so give it the database:")
+        print(
+            f"    sudo chown -R {ctx.target.username}:{group} "
+            f"{ctx.db.path.parent} {ctx.db.path}"
+        )
+    elif custom_state and not compact:
+        print(f"  Database access:      writable by {ctx.target.username}")
+
     if not compact:
         heading("Unit file")
         print(unit)
@@ -1685,6 +1949,12 @@ def cmd_install_systemd(ctx: Context) -> int:
     print(f"  Wrote unit:       {SYSTEMD_UNIT_PATH}")
 
     if getattr(ctx.args, "enable", False):
+        if state_problem is not None:
+            print("  Not enabling: the service would fail to open its database.")
+            print("  Fix the ownership above, then run:")
+            print("    sudo systemctl daemon-reload")
+            print("    sudo systemctl enable --now honeypath.service")
+            return 1
         for command in (
             ["systemctl", "daemon-reload"],
             ["systemctl", "enable", "--now", "honeypath.service"],
@@ -1773,9 +2043,7 @@ def cmd_setup_ssh_canary(ctx: Context) -> int:
         return 1
 
     heading("Phase 1: copying SSH client state")
-    inventory = ssh_canary.inventory_ssh_dir(
-        source, allow_unsafe_symlinks=args.allow_unsafe_symlinks
-    )
+    inventory = ssh_canary.inventory_ssh_dir(source)
     if inventory.refused:
         print("  refused (not copied):")
         for item in inventory.refused:
@@ -1996,9 +2264,7 @@ def _activate_ssh_canary(ctx: Context) -> int:
     # take the authoritative inventory, synchronize every byte, rebuild the
     # generated config, and proceed immediately to the rename.
     heading("Final just-in-time SSH synchronization")
-    inventory = ssh_canary.inventory_ssh_dir(
-        source, allow_unsafe_symlinks=args.allow_unsafe_symlinks
-    )
+    inventory = ssh_canary.inventory_ssh_dir(source)
     if inventory.refused:
         print("BLOCKED: current ~/.ssh contains entries that cannot be migrated:")
         for item in inventory.refused:
@@ -2154,9 +2420,20 @@ def cmd_restore_ssh_canary(ctx: Context) -> int:
                 except (OSError, safe_write.SafeWriteError) as exc:
                     print(f"  could not restore backup: {exc}")
                     if aside is not None:
-                        safe_write.rename_noreplace(aside, ssh_dir, root=home)
+                        # Putting the canary back is itself a rename that can
+                        # fail.  Letting that escape would replace a reported
+                        # failure with a traceback and hide where both trees
+                        # ended up.
+                        try:
+                            safe_write.rename_noreplace(aside, ssh_dir, root=home)
+                        except (OSError, safe_write.SafeWriteError) as undo_exc:
+                            print(f"  could not move the canary back: {undo_exc}")
+                            print(f"  the canary directory is still at {aside}")
+                            print(f"  the backup is still at {backup}")
+                            print(f"  nothing is at {ssh_dir}; move one back by hand")
                     return 1
-                ctx.db.deactivate_under(str(ssh_dir) + "/")
+                # Deactivation happens once, below, so the summary reports the
+                # rows this run actually changed.
 
     heading("Git")
     ssh_canary.restore_git_ssh_command(ctx.db, target, dry_run=ctx.dry_run)
@@ -2289,9 +2566,14 @@ def cmd_setup_windows_audit(ctx: Context) -> int:
         return 0
 
     code = windows_audit.setup_windows_audit(
-        ctx.db, dry_run=ctx.dry_run, confirm=ctx.confirm
+        ctx.db,
+        dry_run=ctx.dry_run,
+        confirm=ctx.confirm,
+        relaunch_extra=relaunch_extra(ctx),
     )
     if code != 0:
+        # A hand-off to an elevated console is reported as its own exit code so
+        # scripts can tell "someone else is doing it" from "it failed".
         return code
 
     if getattr(ctx.args, "install_windows_watcher", False):
@@ -2300,6 +2582,14 @@ def cmd_setup_windows_audit(ctx: Context) -> int:
         if home is None:
             print("  no Windows home detected; skipping")
             return code
+        # Ask before the secrets are read: declining must not load credentials
+        # into this process at all.
+        if not ctx.confirm(
+            "Write a PowerShell watcher (containing your Pushover credentials) into "
+            f"{home}\\.honeypath and register it as a logon scheduled task?"
+        ):
+            print("  skipped")
+            return code
         token_path, user_path = alerts_mod.TOKEN_FILE, alerts_mod.USER_FILE
         try:
             token = token_path.read_text().strip()
@@ -2307,12 +2597,6 @@ def cmd_setup_windows_audit(ctx: Context) -> int:
         except OSError as exc:
             print(f"  cannot read Pushover credentials: {exc}")
             return 1
-        if not ctx.confirm(
-            "Write a PowerShell watcher (containing your Pushover credentials) into "
-            f"{home}\\.honeypath and register it as a logon scheduled task?"
-        ):
-            print("  skipped")
-            return code
         code = windows_audit.install_windows_watcher(
             ctx.db, home, token=token, user_key=user_key, dry_run=ctx.dry_run
         )
@@ -2435,7 +2719,6 @@ def build_parser() -> argparse.ArgumentParser:
         handler=cmd_setup,
         activate=False,
         allow_agent_forwarding=False,
-        allow_unsafe_symlinks=False,
         force_managed_identities=False,
         no_authorized_keys=False,
         skip_git=False,
@@ -2523,6 +2806,54 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not bump canary mtimes to re-arm relatime",
     )
+    watch.add_argument(
+        "--windows-atime",
+        choices=WINDOWS_ATIME_MODES,
+        default=DEFAULT_WINDOWS_ATIME,
+        help=(
+            "how to treat atime reads of Windows canaries: log (default, record "
+            "without alerting), alert, or off. NTFS last-access times move for "
+            "any backup or indexing pass and name no process"
+        ),
+    )
+    watch.add_argument(
+        "--allow-process",
+        action="append",
+        metavar="PATTERN",
+        help=(
+            "Windows process image whose audited reads are recorded but not "
+            "alerted (repeatable; case-insensitive glob on image path or "
+            "basename, e.g. 'bzserv.exe')"
+        ),
+    )
+    watch.add_argument(
+        "--allow-known-scanners",
+        action="store_true",
+        help=(
+            "allowlist the common backup, anti-malware and indexing processes "
+            "(Backblaze, Defender, Windows Search) — see KNOWN_SCANNER_PROCESSES"
+        ),
+    )
+    watch.add_argument(
+        "--sweep-window",
+        default=DEFAULT_SWEEP_WINDOW,
+        type=float,
+        help=(
+            "quiet period, in seconds, after which a burst of alerts across "
+            "several canaries is summarised into one message; 0 disables"
+        ),
+    )
+    watch.add_argument(
+        "--sweep-threshold",
+        default=DEFAULT_SWEEP_THRESHOLD,
+        type=int,
+        help="alerts held in one burst before they are summarised rather than sent",
+    )
+    watch.add_argument(
+        "--no-attribution",
+        action="store_true",
+        help="do not scan /proc to name the process that read a Linux canary",
+    )
     watch.set_defaults(handler=cmd_watch)
 
     mute = sub.add_parser(
@@ -2580,12 +2911,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-agent-forwarding",
         action="store_true",
         help="do not disable ForwardAgent in the relocated config",
-    )
-    setup_ssh.add_argument(
-        "--allow-unsafe-symlinks",
-        action="store_true",
-        help="report legacy symlink intent; anchored migration never "
-        "follows SSH source symlinks",
     )
     setup_ssh.add_argument(
         "--force-managed-identities",

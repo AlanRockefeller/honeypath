@@ -147,7 +147,8 @@ Be precise about this, because "never transmitted" would be wrong:
 The one deliberate exception is the optional Windows-resident watcher
 (`setup-windows-audit --install-windows-watcher`), which writes a PowerShell
 script containing both values onto the Windows filesystem. It is opt-in, it
-prompts first, it says so loudly, and `restore-ssh-canary` removes it.
+prompts first, it says so loudly, and `setup-windows-audit --restore` removes
+it.
 
 ---
 
@@ -235,7 +236,7 @@ touched the AWS canary last week.
 2026-08-02 06:47:22Z  INFO   alert delivered via Pushover for /home/alan/.aws/credentials
 2026-08-02 06:49:02Z  EVENT  READ  severity=critical  kind=aws-credentials  path=/home/alan/.aws/credentials  via=inotify  detail=(methods=inotify | OPEN)  [suppressed: per-path cooldown]
 2026-08-02 07:15:44Z  WARN   [atime] could not re-arm /mnt/c/Users/alan/.aws/credentials: Operation not permitted
-2026-08-02 07:20:03Z  ERROR  alert delivery FAILED for /home/alan/.netrc: HTTP 429
+2026-08-02 07:20:03Z  ERROR  alert delivery FAILED for /home/alan/.pgpass: HTTP 429
 ```
 
 Five levels, so `grep` is enough to triage:
@@ -310,7 +311,11 @@ atime is unreliable, and you should understand why before trusting it:
 - **`O_NOATIME`** lets a caller read a file without updating atime. A stealer
   that uses it is invisible to this method.
 - **NTFS** disables last-access updates by default (`fsutil behavior query
-  disablelastaccess`).
+  disablelastaccess`) — but not always. Where they *are* enabled, the problem
+  inverts: every backup agent, anti-malware scan and search-indexer pass that
+  walks the profile advances the atime of every canary, and atime cannot say
+  which of them did it. See
+  [Windows canary atime is advisory by default](#windows-canary-atime-is-advisory-by-default).
 
 Honeypath's workaround for `relatime` on native Linux filesystems: after
 recording an access, it bumps the canary's **mtime** to now (`os.utime`, mtime
@@ -324,9 +329,112 @@ the reliable mechanism.
 atime remains a low-confidence fallback. Treat inotify (or Windows SACL) as the
 real signal.
 
+### Windows canary atime is advisory by default
+
+On a WSL host with NTFS last-access updates enabled, atime polling of
+`/mnt/c` canaries reports a full set of critical reads roughly once an hour,
+forever. The cause is ordinary machine activity — a backup pass, a scheduled
+anti-malware scan, the search indexer — and atime carries **no process
+attribution**, so Honeypath cannot tell any of them from a stealer.
+
+Since 0.2, atime reads of `platform=windows` canaries are therefore
+**advisory**: recorded as events, visible in `honeypath.py events` and the log
+file, never delivered. The event row says
+`suppressed: advisory detection method`.
+
+```bash
+watch --windows-atime=log     # default: record, do not alert
+watch --windows-atime=alert   # pre-0.2 behaviour
+watch --windows-atime=off     # do not even record the read
+```
+
+Three things this deliberately does **not** silence:
+
+- **Removal or replacement** of a Windows canary still alerts in every mode.
+  A scanner reads files; it does not delete them.
+- **Any Linux canary.** `platform=linux` atime hits are unaffected.
+- **A corroborated read.** If SACL auditing or inotify sees the same read
+  inside the coalescing window, the event is delivered — those methods name
+  the process, so the event is no longer just an unexplained timestamp move.
+
+If you want Windows-side reads detected properly rather than merely quietened,
+that is what [`setup-windows-audit`](#the-fix-setup-windows-audit) is for. You
+can also turn the noise off at the source, on the Windows side:
+
+```powershell
+fsutil behavior set DisableLastAccess 1   # the Windows default on most systems
+```
+
 ### Windows SACL auditing (WSL only)
 
 See [the WSL section](#wsl-linux-side-vs-windows-side-reads).
+
+### Allowlisting known scanners
+
+SACL auditing gives what atime cannot: the image path of the reading process.
+That makes it possible to suppress a backup agent by name rather than by
+guesswork.
+
+```bash
+# Repeatable, case-insensitive glob on the image path or its basename.
+watch --allow-process 'bzserv.exe' --allow-process 'C:\Program Files\Backblaze\*'
+
+# Or take the bundled list: Backblaze, Defender, Windows Search.
+watch --allow-known-scanners
+```
+
+Allowlisted reads are recorded with their process name and marked
+`allowlisted process: <pattern>` in the event detail; they are never delivered.
+The active patterns are printed at startup and written to the log every
+session, because **an allowlist is a deliberate blind spot**: malware running
+inside an allowlisted process — injected, or simply named to match a loose
+pattern — reads every canary without waking anyone. Prefer basenames over
+directory globs, keep the list short, and remember `honeypath.py events`
+remains the ground truth regardless of what was delivered.
+
+### Naming the reader on Linux
+
+inotify reports that a canary was read and never says by whom. On an OPEN
+event Honeypath walks `/proc` looking for a descriptor pointing at the canary's
+inode, and attaches whatever it finds to the event and the alert body:
+
+```
+HONEYPATH high pgpass via inotify
+/home/alan/.pgpass
+psql pid=48213
+```
+
+This races the reader's `close()` and loses against anything that opens, reads
+and closes quickly, so attribution is a bonus and never a guarantee — an
+unattributed read is alerted on exactly as before. Because Honeypath [runs
+unprivileged by design](#the-service-runs-as-your-unprivileged-target-user-not-as-root),
+the scan only sees processes owned by the same user, which is precisely the
+threat model that matters: malware running as you needs no privilege to read
+your secrets. Disable with `--no-attribution`.
+
+### Sweep aggregation
+
+A profile-wide read touches every canary at once, and twelve notifications say
+nothing that one summary naming twelve paths does not — they are just the ones
+that get swiped away. The **first** detection of a burst is delivered
+immediately; the rest are held until the burst goes quiet (default 30 s) and
+then summarised:
+
+```
+HONEYPATH sweep: 11 more canaries read (critical)
+/mnt/c/Users/alanr/.git-credentials
+/mnt/c/Users/alanr/.npmrc
+...
+```
+
+Tune with `--sweep-window` (0 disables) and `--sweep-threshold`. A burst
+smaller than the threshold is sent as individual alerts rather than summarised.
+Every event is written to SQLite and the log file before it reaches the
+aggregator, so a summary omits nothing that was actually recorded — and a burst
+still being held at shutdown is flushed, not dropped.
+
+Note that this does **not** suppress a credential stealer sweeping your
+canaries: that produces the same shape, and it produces it as an alert.
 
 ### Dedup, cooldown, mute
 
@@ -342,6 +450,12 @@ suppressed, and the event row says why.
 
 `mute --minutes N` does the same globally, for when *you* are the one touching
 the canaries (backups, dotfile syncs, housekeeping).
+
+Every alert that survives dedup, cooldown and mute is delivered at Pushover's
+normal priority. There is no per-severity loudness: a read is either worth
+alerting on or it is not, and Honeypath only sends the ones that are. The
+canary's severity still labels the alert body, the log line and the
+`events --severity` filter — it just never decides how the alert lands.
 
 ---
 
@@ -396,9 +510,21 @@ This:
    (atime on NTFS stays a low-confidence fallback regardless — the SACL is the
    primary signal).
 
-Both steps require **administrator** privileges. If your WSL session cannot run
-elevated Windows commands, Honeypath prints the exact elevated-PowerShell
-commands to run instead of failing silently.
+Both steps require **administrator** privileges — SACL changes need
+`SeSecurityPrivilege`. When your WSL session is not elevated, Honeypath does not
+start work that cannot finish: it offers to request elevation for you.
+Answering yes raises a Windows UAC prompt and re-runs this one step as root in a
+new console (`Start-Process -Verb RunAs` → `cmd.exe /k wsl.exe -d <distro> -u
+root -- …`), which stays open so you can read the result. The exit code is `3`
+("handed off to an elevated session"), distinct from success and from failure.
+
+Decline the prompt — or run non-interactively — and it prints the manual
+`auditpol` line plus the fully-resolved `wsl.exe -d <your-distro>` command,
+with the real distribution name substituted. The name comes from
+`WSL_DISTRO_NAME`, falling back to the environment of a parent process because
+`sudo` strips it. If the name cannot be determined, Honeypath says so and points
+at `wsl.exe -l -q` rather than emitting a command that would fail with
+`WSL_E_DISTRO_NOT_FOUND`.
 
 `watch` then queries `RecordId > checkpoint` oldest-first in bounded pages
 until no unseen Security/4663 records remain. Each match is inserted
@@ -529,9 +655,9 @@ normally touches your credentials — but it is noise if you did not expect it.
 Two guarantees make this safe:
 
 1. **Every host referenced is under the reserved `.invalid` TLD** (RFC 2606),
-   which by definition never resolves. A canary `.netrc`, `.npmrc` or
-   `.pgpass` cannot cause curl, git, npm or psql to send anything to a real
-   server. This is enforced by the test suite.
+   which by definition never resolves. A canary `.npmrc` or `.pgpass` cannot
+   cause curl, git, npm or psql to send anything to a real server. This is
+   enforced by the test suite.
 2. **Canaries add scoped credentials, they do not override defaults.** The
    canary `.npmrc` declares a token for a registry nobody uses; it does *not*
    set `registry=`, which would repoint every `npm install` at a dead host.
@@ -549,6 +675,24 @@ Other things that will trip canaries, all benign:
 
 Use `mute --minutes 60` before doing housekeeping. Events keep being recorded,
 so you can review afterwards with `events --limit 100`.
+
+For the recurring, unattended cases — a backup agent scanning hourly forever —
+muting is the wrong tool, because you have to remember to un-mute. Reach for
+the mechanisms that suppress delivery without suppressing recording:
+[advisory Windows atime](#windows-canary-atime-is-advisory-by-default),
+[scanner allowlisting](#allowlisting-known-scanners) and
+[sweep aggregation](#sweep-aggregation). The first thing to do, though, is find
+out *what* is reading them — [`/proc` attribution](#naming-the-reader-on-linux)
+on Linux, [`setup-windows-audit`](#the-fix-setup-windows-audit) on Windows.
+Silencing an unidentified reader is the one move you should not make.
+
+Sometimes the right answer is that the path is a bad canary. `~/.netrc` used to
+be in the catalog and no longer is: git's HTTP transport enables libcurl's
+`CURLOPT_NETRC`, so *every* `git push` or `git fetch` over HTTPS reads it before
+the credential helper is consulted. On a machine where you push several times a
+day that canary fires on ordinary work, and a canary that cries wolf on
+`git push` is worse than no canary — you learn to swipe the alert away. A canary
+belongs on a path nothing you run touches by routine.
 
 Browser login databases are **watch/report-only**. Honeypath never creates a
 fake `Login Data` or `logins.json` — writing files into a live browser profile
@@ -590,14 +734,15 @@ independently and re-checked immediately before the write:
 4. its per-canary managed identifier matches the expected canary ID;
 5. the destination is reached below the approved home through held directory
    file descriptors, with no
-   symlinked parent component;
-6. consequently, a credential file Honeypath did not write can never be
-   selected — being recorded in the database is not on its own enough.
+   symlinked parent component.
+
+Together these mean a credential file Honeypath did not write can never be
+selected — being recorded in the database is not on its own enough.
 
 Anything that fails a check is reported and skipped, never replaced:
 
 ```
-refused: not recorded as a Honeypath-managed canary (--refresh-managed declined): /home/alan/.netrc
+refused: not recorded as a Honeypath-managed canary (--refresh-managed declined): /home/alan/.pgpass
 ```
 
 ---
@@ -729,7 +874,7 @@ relocated config, installs the wrappers, optionally fixes `PATH` and git, and
 prints test commands. **Nothing under `~/.ssh` changes.**
 
 Copy rules: sockets, devices and FIFOs are refused; symlinks pointing outside
-the source tree are refused (`--allow-unsafe-symlinks` to override); no silent
+the source tree are refused; no silent
 overwrites in the destination. Files are copied as **opaque bytes** — Honeypath
 never parses, displays or logs private-key contents. It does hash file bytes
 locally for drift detection; those hashes live only in the local SQLite
@@ -888,6 +1033,13 @@ What to look for:
 `setup-ssh-canary` prints this checklist at the end of phase 1, and again with
 the breakage warning immediately before the phase 2 confirmation prompt.
 
+Guided `setup` prints it a third time, as its closing section, whenever it
+prepared phase 1 during that run — a wizard that ends without saying so would
+leave you believing SSH was covered when `~/.ssh` still holds the real keys and
+no canary exists. That section states what is and is not protected, the tests
+above, the `setup-ssh-canary --activate` command that completes the work, and
+the `ssh-status` / `restore-ssh-canary` commands for checking and backing out.
+
 ### `authorized_keys` — server-side state
 
 `~/.ssh` is client *and* server state. If `sshd` (or macOS Remote Login) is in
@@ -971,8 +1123,16 @@ systemd creates and chowns `/var/lib/honeypath` to the service user before the
 process starts, so the database and the [`honeypath.log`](#the-log-file) beside
 it live at their documented paths with no root-owned directory and no manual
 `chown`. A non-default `--db` or `--log-file` gets an explicit
-`ReadWritePaths=` grant instead, and that directory must already exist and be
-writable by the service user.
+`ReadWritePaths=` grant instead.
+
+That grant only relaxes systemd's filesystem sandbox — it cannot make a
+root-owned SQLite file writable by an unprivileged `User=`. So when a run under
+`sudo` creates a custom database, Honeypath hands the database, its `-wal`/`-shm`
+sidecars and any directory it had to create to the target user before the unit
+is ever written. A directory that already existed keeps whatever ownership you
+gave it, and `install-systemd` checks that the service user can actually write
+the database, printing the `chown` to run — and declining to `--enable` a
+service that would only fail to start.
 
 ### Hardening, and what is deliberately absent
 
@@ -1060,8 +1220,16 @@ These are hard constraints, enforced in code and covered by tests:
   exchange, verifies that the exchanged-out inode is the exact hash-checked
   object, and exchanges back on mismatch without destroying the independently
   appeared file. Managed replacement on unsupported filesystems fails closed.
-  For brand-new reproducible Windows-home canaries on DrvFS, which lacks
-  `O_TMPFILE`, Honeypath falls back to anchored `O_EXCL|O_NOFOLLOW` creation.
+  For brand-new reproducible canaries where `O_TMPFILE` does not exist — DrvFS
+  Windows homes, and macOS, whose kernel has no equivalent at all — Honeypath
+  falls back to anchored `O_EXCL|O_NOFOLLOW` creation. That fallback can never
+  clobber an existing credential; only all-at-once content visibility is
+  relaxed, and managed *replacement* still requires the Linux primitives.
+- **A write and its manifest row commit together.** Verification and database
+  registration run inside the write, while the replaced inode is still staged.
+  If either fails — an unreadable file, a full database — the previous canary is
+  exchanged back and a brand-new one is removed, so a refresh can never leave a
+  file on disk that the recorded hash and inode no longer describe.
   This relaxes only all-at-once content visibility: containment, inode identity,
   and no-clobber are never relaxed. Important files and parent directories are
   fsynced; DrvFS may relax mode/ownership only.

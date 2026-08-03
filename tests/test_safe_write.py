@@ -8,6 +8,7 @@ attacker who merely has write access to their own home.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import unittest
@@ -149,6 +150,103 @@ class AtomicWriteTests(TempHomeCase):
         # A genuine replace, not an in-place truncate-and-rewrite.
         self.assertNotEqual(os.lstat(path).st_ino, original_inode)
 
+    def test_on_installed_sees_the_new_content_before_it_commits(self):
+        path = self.home / ".netrc"
+        path.write_text("old\n")
+        seen: list[str] = []
+        safe_write.atomic_write(
+            path,
+            "new\n",
+            mode=0o600,
+            root=self.home,
+            on_installed=lambda: seen.append(path.read_text()),
+        )
+        self.assertEqual(seen, ["new\n"])
+        self.assertEqual(path.read_text(), "new\n")
+
+    def test_a_rejected_replacement_puts_the_previous_inode_back(self):
+        path = self.home / ".netrc"
+        path.write_text("old\n")
+        original_inode = os.lstat(path).st_ino
+
+        def reject():
+            raise safe_write.InstallHookError("caller said no")
+
+        with self.assertRaises(safe_write.InstallHookError):
+            safe_write.atomic_write(
+                path, "new\n", mode=0o600, root=self.home, on_installed=reject
+            )
+        self.assertEqual(path.read_text(), "old\n")
+        self.assertEqual(os.lstat(path).st_ino, original_inode)
+        self.assertEqual(self._temporaries(self.home), [])
+
+    def test_a_rejected_creation_removes_the_new_file(self):
+        path = self.home / ".netrc"
+
+        def reject():
+            raise safe_write.InstallHookError("caller said no")
+
+        with self.assertRaises(safe_write.InstallHookError):
+            safe_write.atomic_write(
+                path, "canary\n", mode=0o600, root=self.home, on_installed=reject
+            )
+        self.assertFalse(path.exists())
+        self.assertEqual(self._temporaries(self.home), [])
+
+    def test_a_rejected_creation_is_undone_on_the_portable_path_too(self):
+        path = self.home / ".netrc"
+        unavailable = safe_write.SafeWriteError("O_TMPFILE unsupported")
+
+        def reject():
+            raise safe_write.InstallHookError("caller said no")
+
+        with mock.patch.object(
+            safe_write, "_open_unnamed_temporary", side_effect=unavailable
+        ):
+            with self.assertRaises(safe_write.InstallHookError):
+                safe_write.atomic_write(
+                    path,
+                    "canary\n",
+                    mode=0o600,
+                    root=self.home,
+                    allow_exclusive_create_fallback=True,
+                    on_installed=reject,
+                )
+        self.assertFalse(path.exists())
+
+    def test_an_install_hook_error_is_not_mistaken_for_a_refusal(self):
+        """Callers that map SafeWriteError to "refused" must not swallow it."""
+        self.assertFalse(
+            issubclass(safe_write.InstallHookError, safe_write.SafeWriteError)
+        )
+        self.assertTrue(issubclass(safe_write.RollbackError, safe_write.SafeWriteError))
+
+    def test_a_rollback_that_cannot_complete_is_reported_as_fatal(self):
+        path = self.home / ".netrc"
+        path.write_text("old\n")
+
+        def reject():
+            raise safe_write.InstallHookError("caller said no")
+
+        # The exchange back is the only thing that fails; the destination is
+        # left holding content no caller committed to, so it must be loud.
+        real_exchange = safe_write._renameat_exchange
+        calls: list[int] = []
+
+        def flaky(*args):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("exchange unavailable")
+            return real_exchange(*args)
+
+        with mock.patch.object(safe_write, "_renameat_exchange", side_effect=flaky):
+            with self.assertRaises(safe_write.RollbackError) as raised:
+                safe_write.atomic_write(
+                    path, "new\n", mode=0o600, root=self.home, on_installed=reject
+                )
+        self.assertIn("FATAL", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, safe_write.InstallHookError)
+
     def test_refuses_to_write_through_a_symlinked_destination(self):
         outside = self.root / "real-secrets"
         outside.write_text("SECRET\n")
@@ -190,19 +288,15 @@ class AtomicWriteTests(TempHomeCase):
             target = directory / f"file{index}"
             target.write_text("old")
             original = safe_write._random_temp_name
-
             captured: list[str] = []
 
-            def spy():
-                name = original()
-                captured.append(name)
+            def spy(_original=original, _captured=captured):
+                name = _original()
+                _captured.append(name)
                 return name
 
-            safe_write._random_temp_name = spy
-            try:
+            with mock.patch.object(safe_write, "_random_temp_name", spy):
                 safe_write.atomic_write(target, "x", mode=0o600, root=self.home)
-            finally:
-                safe_write._random_temp_name = original
             seen.add(captured[0])
         self.assertEqual(len(seen), 5)
         for name in seen:
@@ -287,7 +381,7 @@ class AtomicWriteTests(TempHomeCase):
         path.write_text("old")
         victim = self.root / "victim"
         victim.write_text("SECRET")
-        expected = __import__("hashlib").sha256(b"old").hexdigest()
+        expected = hashlib.sha256(b"old").hexdigest()
         real_exchange = safe_write._renameat_exchange
 
         def race(parent_fd, stage, destination):
@@ -311,7 +405,7 @@ class AtomicWriteTests(TempHomeCase):
     def test_observed_staging_name_cannot_substitute_payload(self):
         path = self.home / "managed"
         path.write_text("old")
-        expected = __import__("hashlib").sha256(b"old").hexdigest()
+        expected = hashlib.sha256(b"old").hexdigest()
         real_exchange = safe_write._renameat_exchange
         attacked = False
 
@@ -349,7 +443,7 @@ class AtomicWriteTests(TempHomeCase):
     def test_destination_changed_after_hash_is_restored_not_overwritten(self):
         path = self.home / "managed"
         path.write_text("old")
-        expected = __import__("hashlib").sha256(b"old").hexdigest()
+        expected = hashlib.sha256(b"old").hexdigest()
         real_exchange = safe_write._renameat_exchange
         attacked = False
 
@@ -383,14 +477,17 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(path.read_text(), "ATTACKER")
 
     def test_exception_closes_fds_and_removes_temporary(self):
-        before = len(list(Path("/proc/self/fd").iterdir()))
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.is_dir():
+            self.skipTest("no procfs; open descriptors cannot be counted")
+        before = len(list(fd_dir.iterdir()))
         path = self.home / "failure"
         with mock.patch.object(safe_write, "_write_all", side_effect=OSError("boom")):
             with self.assertRaises(OSError):
                 safe_write.atomic_write(
                     path, "x", mode=0o600, root=self.home, replace=False
                 )
-        after = len(list(Path("/proc/self/fd").iterdir()))
+        after = len(list(fd_dir.iterdir()))
         self.assertEqual(after, before)
         self.assertEqual(self._temporaries(self.home), [])
 

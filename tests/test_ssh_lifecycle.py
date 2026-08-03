@@ -67,15 +67,13 @@ class InventoryTests(TempHomeCase):
         self.assertNotIn("linked", inventory.entries)
         self.assertTrue(any("symlink" in r for r in inventory.refused))
 
-    def test_unsafe_symlink_flag_does_not_weaken_anchored_reads(self):
+    def test_symlink_out_of_the_tree_is_never_followed(self):
         outside = self.root / "secret.txt"
         outside.write_text("elsewhere")
         (self.ssh / "linked").symlink_to(outside)
-        inventory = ssh_canary.inventory_ssh_dir(self.ssh, allow_unsafe_symlinks=True)
+        inventory = ssh_canary.inventory_ssh_dir(self.ssh)
         self.assertNotIn("linked", inventory.entries)
-        self.assertTrue(
-            any("cannot weaken anchored reads" in r for r in inventory.refused)
-        )
+        self.assertTrue(any("linked" in r and "symlink" in r for r in inventory.refused))
 
     def test_symlink_inside_the_tree_is_also_refused(self):
         (self.ssh / "id_rsa").write_text("KEY")
@@ -434,6 +432,25 @@ class ActivationTests(TempHomeCase):
         self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
         paths = {c.path for c in self.db.get_canaries()}
         self.assertNotIn(str(restored), paths)
+
+    def test_authorized_keys2_is_preserved_too(self):
+        # Regression: authorized_keys2 is in GENERATED_FILES, so it is never
+        # migrated to the relocated directory.  If activation does not restore
+        # it as well, a configured authorized_keys2 is silently lost.
+        (self.ssh / "authorized_keys").write_text("ssh-ed25519 AAAA primary\n")
+        (self.ssh / "authorized_keys2").write_text("ssh-ed25519 AAAA secondary\n")
+        self.activate()
+        restored = self.ssh / "authorized_keys2"
+        self.assertTrue(restored.exists())
+        self.assertIn("secondary", restored.read_text())
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+        paths = {c.path for c in self.db.get_canaries()}
+        self.assertNotIn(str(restored), paths)
+
+    def test_authorized_keys2_alone_is_preserved(self):
+        (self.ssh / "authorized_keys2").write_text("ssh-ed25519 AAAA only-two\n")
+        self.activate()
+        self.assertIn("only-two", (self.ssh / "authorized_keys2").read_text())
 
     def test_authorized_keys_opt_out(self):
         (self.ssh / "authorized_keys").write_text("ssh-ed25519 AAAA key\n")

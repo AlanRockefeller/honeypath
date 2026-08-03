@@ -161,19 +161,22 @@ def ensure_directory(
     *,
     mode: int = MODE_DIR_PRIVATE,
     best_effort: bool = False,
+    root: Path | None = None,
 ) -> list[str]:
-    """Create ``path`` (and missing parents) owned by the target user."""
-    problems: list[str] = []
-    missing: list[Path] = []
-    probe = path
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
-    path.mkdir(parents=True, exist_ok=True)
-    for created in reversed(missing):
-        problems.extend(
-            apply_ownership(created, target, mode=mode, best_effort=best_effort)
-        )
-    return problems
+    """Create ``path`` (and missing parents) owned by the target user.
+
+    Every component is created and chowned through held directory descriptors
+    below ``root`` (the target home by default).  A pathname-based
+    ``mkdir(parents=True)`` followed by ``chown`` would let a symlink swapped
+    in between the two steps redirect the ownership change outside the home.
+    """
+    from . import safe_write
+
+    return safe_write.safe_mkdir(
+        path,
+        root if root is not None else target.home,
+        mode=mode,
+        uid=target.uid,
+        gid=target.gid,
+        best_effort_metadata=best_effort,
+    )

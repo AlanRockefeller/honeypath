@@ -65,10 +65,12 @@ class TransactionalActivationTests(TempHomeCase):
             with self.subTest(fail_index=fail_index):
                 calls = {"n": 0}
 
-                def injected(*args, **kwargs):
+                # fail_index is bound per iteration: a late-binding closure
+                # would make every subtest use the loop's final value.
+                def injected(*args, _fail_index=fail_index, **kwargs):
                     index = calls["n"]
                     calls["n"] += 1
-                    if index == fail_index:
+                    if index == _fail_index:
                         return CanaryCreateResult(args[0], False, "injected failure")
                     return real(*args, **kwargs)
 

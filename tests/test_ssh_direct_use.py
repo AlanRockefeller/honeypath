@@ -242,6 +242,15 @@ class RollbackBackupTests(TempHomeCase):
         self.assertIn(fallback, found)
         self.assertEqual(ssh_canary.latest_valid_backup(self.home), fallback)
 
+    def test_a_newer_backup_root_entry_beats_an_older_exdev_fallback(self):
+        # Regression: the two locations use different name prefixes, so
+        # ordering by whole name put every fallback last no matter its age.
+        fallback = self.home / ".ssh.honeypath-backup.20240101-000000"
+        fallback.mkdir()
+        newest = self.make_backup("20240505-000000", "newer")
+        self.assertEqual(ssh_canary.list_backups(self.home), [fallback, newest])
+        self.assertEqual(ssh_canary.latest_valid_backup(self.home), newest)
+
     def test_a_symlinked_backup_is_not_treated_as_valid(self):
         real = self.make_backup("20240101-000000", "real")
         link = ssh_canary.backup_root(self.home) / "ssh-20240909-000000"

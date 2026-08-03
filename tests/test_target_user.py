@@ -18,21 +18,34 @@ class ResolveTargetUserTests(unittest.TestCase):
     def setUp(self):
         self.me = getpass.getuser()
 
+    def skip_if_root(self):
+        """Resolution to the effective user is refused when that user is root.
+
+        Running the suite as root is legitimate (it is how the service-side
+        paths get exercised), and these cases assert the non-root branch.
+        """
+        if os.geteuid() == 0:
+            self.skipTest("effective user is root; this case asserts the non-root path")
+
     def test_explicit_user_wins(self):
+        self.skip_if_root()
         ctx = resolve_target_user(self.me, environ={"SUDO_USER": "root"})
         self.assertEqual(ctx.username, self.me)
 
     def test_sudo_user_used_when_present(self):
+        self.skip_if_root()
         ctx = resolve_target_user(None, environ={"SUDO_USER": self.me})
         self.assertEqual(ctx.username, self.me)
         self.assertEqual(ctx.uid, os.getuid())
 
     def test_sudo_user_root_is_ignored(self):
         # SUDO_USER=root must fall through to the effective user, not to /root.
+        self.skip_if_root()
         ctx = resolve_target_user(None, environ={"SUDO_USER": "root"})
         self.assertEqual(ctx.uid, os.geteuid())
 
     def test_plain_user_falls_back_to_effective_user(self):
+        self.skip_if_root()
         ctx = resolve_target_user(None, environ={})
         self.assertEqual(ctx.uid, os.geteuid())
 

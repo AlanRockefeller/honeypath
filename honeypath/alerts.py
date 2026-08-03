@@ -47,7 +47,12 @@ TOKEN_FILE = CONFIG_DIR / "pushover-token"
 USER_FILE = CONFIG_DIR / "pushover-user"
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
-SEVERITY_PRIORITY = {"critical": 1, "high": 0, "medium": -1, "low": -1}
+# Every alert is sent at Pushover's normal priority.  A detection is either
+# worth waking you for or it is not, and Honeypath only ever sends the ones
+# that are; grading them by the canary's severity only meant that some real
+# intrusions arrived silently.  The severity is still recorded, filterable and
+# printed in the alert body — it just no longer changes delivery.
+ALERT_PRIORITY = 0
 
 
 @dataclass
@@ -102,16 +107,22 @@ def store_credentials(
 
     try:
         config_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
-        info = config_dir.lstat()
+        # Everything after this point acts on the descriptor, never the name:
+        # an lstat/chown pair lets a symlink swapped in between the two hand
+        # root ownership of an arbitrary path to the service group.
+        dir_fd = os.open(config_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise OSError(f"cannot create {config_dir}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise OSError(f"refusing unsafe configuration directory: {config_dir}")
-
-    # The service runs as the target user.  Root-owned, group-readable files
-    # let it read the credentials without making them world-readable.
-    os.chown(config_dir, 0, group_gid)
-    os.chmod(config_dir, 0o750)
+    try:
+        info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"refusing unsafe configuration directory: {config_dir}")
+        # The service runs as the target user.  Root-owned, group-readable files
+        # let it read the credentials without making them world-readable.
+        os.fchown(dir_fd, 0, group_gid)
+        os.fchmod(dir_fd, 0o750)
+    finally:
+        os.close(dir_fd)
     token_file = config_dir / TOKEN_FILE.name
     user_file = config_dir / USER_FILE.name
     for path, value in ((token_file, token), (user_file, user_key)):
@@ -161,9 +172,12 @@ def redact_secrets(text: str, *secrets: str | None) -> str:
 
 
 class Pushover:
-    def __init__(self, token_file: Path = TOKEN_FILE, user_file: Path = USER_FILE):
-        self.token_file = token_file
-        self.user_file = user_file
+    def __init__(self, token_file: Path | None = None, user_file: Path | None = None):
+        # Resolved at call time, not at import time, so that redirecting the
+        # module-level paths (the test suite does) is actually honoured by a
+        # bare ``Pushover()``.
+        self.token_file = TOKEN_FILE if token_file is None else token_file
+        self.user_file = USER_FILE if user_file is None else user_file
 
     def configured(self) -> bool:
         return bool(_read_secret(self.token_file) and _read_secret(self.user_file))
@@ -180,7 +194,6 @@ class Pushover:
         message: str,
         *,
         title: str = "Honeypath",
-        priority: int = 0,
         timeout: int = 15,
     ) -> tuple[bool, str | None]:
         """Send a notification.  Returns ``(sent, error)``.
@@ -207,7 +220,7 @@ class Pushover:
                 "user": user,
                 "message": message,
                 "title": title,
-                "priority": str(priority),
+                "priority": str(ALERT_PRIORITY),
             }
         ).encode("ascii")
 
@@ -259,8 +272,51 @@ def format_alert(event: dict) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def alert_priority(severity: str | None) -> int:
-    return SEVERITY_PRIORITY.get((severity or "").lower(), 0)
+# Pushover truncates at 1024 characters.  Ten paths and a count is well inside
+# that with room for long Windows paths, and a summary is a prompt to go and
+# read `honeypath.py events` — not a replacement for it.
+SWEEP_PATH_LIMIT = 10
+SWEEP_PROCESS_LIMIT = 3
+
+# Worst-first.  Anything unrecognised sorts last rather than raising, because a
+# severity string arriving from the database must never break delivery.
+SEVERITY_ORDER = ("critical", "high", "medium", "low")
+
+
+def worst_severity(severities) -> str:
+    ranked = [s for s in severities if s in SEVERITY_ORDER]
+    if not ranked:
+        return "unknown"
+    return min(ranked, key=SEVERITY_ORDER.index)
+
+
+def format_sweep_alert(events: list[dict]) -> str:
+    """One body for a burst that read many canaries at once.
+
+    Sent after an individual alert for the first canary of the burst, so this
+    message's job is to convey the *shape* of what followed: how many, how bad,
+    and by whom if anything managed to say.
+    """
+    paths: list[str] = []
+    for event in events:
+        path = str(event.get("path") or "")
+        if path and path not in paths:
+            paths.append(path)
+    severity = worst_severity([event.get("severity") for event in events])
+    processes = sorted(
+        {str(event["process_info"]) for event in events if event.get("process_info")}
+    )
+
+    lines = [
+        f"HONEYPATH sweep: {len(paths)} more canaries read ({severity})",
+        *paths[:SWEEP_PATH_LIMIT],
+    ]
+    if len(paths) > SWEEP_PATH_LIMIT:
+        lines.append(f"... and {len(paths) - SWEEP_PATH_LIMIT} more")
+    lines.extend(processes[:SWEEP_PROCESS_LIMIT])
+    if len(processes) > SWEEP_PROCESS_LIMIT:
+        lines.append(f"... and {len(processes) - SWEEP_PROCESS_LIMIT} more processes")
+    return "\n".join(lines)
 
 
 def hostname() -> str:

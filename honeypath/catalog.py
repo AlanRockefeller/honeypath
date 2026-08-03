@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -250,13 +251,6 @@ _CARGO_CREDENTIALS = f"""\
 # {_HEADER}
 [registries.honeypath-canary]
 token = "cioHoneypathCanaryFAKEtoken00000000"
-"""
-
-_NETRC = f"""\
-# {_HEADER}
-machine git.{CANARY_HOST}
-  login honeypath-canary
-  password hpFAKEnetrcPassword000
 """
 
 _PGPASS = f"""\
@@ -577,7 +571,6 @@ def _dev_entries(platform: str, prefix: str) -> list[CanaryEntry]:
       .npmrc                scoped @honeypath-canary registry, no bare registry=
       .pypirc               bare [honeypath-canary] section, no index-servers
       .cargo/credentials.toml   [registries.honeypath-canary]
-      .netrc                machine-keyed, .invalid host only
       .pgpass               host-keyed, .invalid host only
       .my.cnf               [clienthoneypathcanary], never [client]
 
@@ -698,7 +691,10 @@ def _dev_entries(platform: str, prefix: str) -> list[CanaryEntry]:
         CATEGORY_SAFE,
         _CARGO_CREDENTIALS,
     )
-    add(".netrc", "netrc", "netrc", "critical", CATEGORY_SAFE, _NETRC)
+    # .netrc is deliberately absent. git's HTTP transport turns on libcurl's
+    # CURLOPT_NETRC, so every push or fetch over HTTPS reads ~/.netrc before the
+    # credential helper runs — the canary fires on ordinary work, not on an
+    # intruder, and a canary that cries wolf on `git push` trains you to ignore it.
     add(".pgpass", "pgpass", "pgpass", "high", CATEGORY_SAFE, _PGPASS)
     add(".my.cnf", "my.cnf", "mysql_credentials", "high", CATEGORY_SAFE, _MY_CNF)
     add(
@@ -1310,6 +1306,20 @@ def managed_marker(canary_id: str) -> str:
     )
 
 
+def _ancestor_chain(directory: Path, root: Path | str) -> list[Path]:
+    """``directory`` and every ancestor below ``root``, outermost first.
+
+    Falls back to just ``directory`` when it is not under ``root``; safe_mkdir
+    performs the real containment check and refuses anything outside.
+    """
+    try:
+        parts = directory.relative_to(Path(root)).parts
+    except ValueError:
+        return [directory]
+    base = Path(root)
+    return [base.joinpath(*parts[: i + 1]) for i in range(len(parts))]
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -1370,6 +1380,7 @@ def create_canary_file(
     root: Path | str | None = None,
     expected_content_hash: str | None = None,
     durable: bool = False,
+    on_installed: Callable[[], None] | None = None,
 ) -> CanaryCreateResult:
     """Write one canary.  An existing path is *never* clobbered by default.
 
@@ -1382,6 +1393,11 @@ def create_canary_file(
     ``root`` is the containment root for the symlink-safety checks; it
     defaults to the target user's home.  Windows homes under /mnt pass their
     own root.
+
+    ``on_installed`` is the caller's chance to reject a write that has already
+    landed — registering it in the manifest, say.  It runs while the previous
+    file is still recoverable, so raising from it puts that file back and
+    leaves nothing new on disk.  See :func:`safe_write.atomic_write`.
     """
     root = Path(root) if root is not None else target.home
 
@@ -1407,15 +1423,20 @@ def create_canary_file(
         return CanaryCreateResult(path, False, "would create")
 
     problems: list[str] = []
-    parent_mode = 0o700 if path.parent.name.startswith(".") else 0o755
     try:
-        problems += safe_write.safe_mkdir(
-            path.parent,
-            root,
-            mode=parent_mode,
-            uid=target.uid,
-            gid=target.gid,
-        )
+        # Each ancestor is created with a mode chosen from its *own* name, not
+        # from the immediate parent's: ~/.config/gcloud must leave ~/.config
+        # at 0700 even though "gcloud" itself is not dot-prefixed.  safe_mkdir
+        # only applies metadata to directories it actually creates, so walking
+        # the chain prefix by prefix is idempotent.
+        for ancestor in _ancestor_chain(path.parent, root):
+            problems += safe_write.safe_mkdir(
+                ancestor,
+                root,
+                mode=0o700 if ancestor.name.startswith(".") else 0o755,
+                uid=target.uid,
+                gid=target.gid,
+            )
     except safe_write.SafeWriteError as exc:
         return CanaryCreateResult(path, False, f"refused: {exc}")
     except OSError as exc:
@@ -1436,11 +1457,22 @@ def create_canary_file(
             fsync_data=durable,
             replace=replace_managed,
             expected_sha256=expected_content_hash if replace_managed else None,
-            # DrvFS/9p does not implement O_TMPFILE.  For new Windows-home
-            # canaries use anchored O_EXCL creation: it may expose bytes while
-            # they are written, but can never replace an existing credential.
-            allow_exclusive_create_fallback=best_effort and not replace_managed,
+            # DrvFS/9p does not implement O_TMPFILE, and neither does any
+            # non-Linux kernel: on macOS *every* write would otherwise be
+            # refused and no canary could be created at all.  For brand-new
+            # files use anchored O_EXCL creation instead: it may expose bytes
+            # while they are written, but can never replace an existing
+            # credential.  Replacement still requires the Linux CAS primitives.
+            allow_exclusive_create_fallback=(
+                (best_effort or not safe_write.supports_unnamed_temporary())
+                and not replace_managed
+            ),
+            on_installed=on_installed,
         )
+    except safe_write.RollbackError:
+        # The write landed, was rejected, and could not be undone.  That is the
+        # caller's emergency, not a path this function may report as "refused".
+        raise
     except safe_write.SafeWriteError as exc:
         return CanaryCreateResult(path, False, f"refused: {exc}")
     except OSError as exc:

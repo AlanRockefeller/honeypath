@@ -101,7 +101,14 @@ class SshCanaryIntegrationTests(TempHomeCase):
         if ssh_canary.SYSTEM_SSH_CONFIG.exists():
             text += f"\nInclude {ssh_canary.SYSTEM_SSH_CONFIG}\n"
         self.baseline_config.write_text(text)
-        self.baselines = {h: self.ssh_g(h, self.baseline_config)[1] for h in self.HOSTS}
+        self.baselines = {}
+        for host in self.HOSTS:
+            code, lines, err = self.ssh_g(host, self.baseline_config)
+            # An unchecked baseline that failed would be an empty option list,
+            # and every later "nothing changed" comparison would pass vacuously.
+            self.assertEqual(code, 0, f"baseline ssh -G {host} failed: {err}")
+            self.assertTrue(lines, f"baseline ssh -G {host} produced no output")
+            self.baselines[host] = lines
 
     def ssh_g(self, host, config):
         proc = subprocess.run(
@@ -216,11 +223,15 @@ class SshCanaryIntegrationTests(TempHomeCase):
         self.phase_one()
         relocated_key = ssh_canary.relocated_dir(self.home) / "id_ed25519"
         before = ssh_canary.sha256_file(relocated_key)
-        activated, backup = ssh_canary.activate(self.db, self.target, log=self.log)
+        with self.quiet():
+            activated, backup = ssh_canary.activate(self.db, self.target, log=self.log)
         self.assertTrue(activated)
         assert backup is not None
         (self.ssh / "id_ed25519").write_text("FAKE CANARY EDIT")
-        second, _ = ssh_canary.activate(self.db, self.target, force=True, log=self.log)
+        with self.quiet():
+            second, _ = ssh_canary.activate(
+                self.db, self.target, force=True, log=self.log
+            )
         self.assertFalse(second)
         self.assertEqual(ssh_canary.sha256_file(relocated_key), before)
         self.assertEqual(
@@ -235,7 +246,10 @@ class SshCanaryIntegrationTests(TempHomeCase):
             "create_canary_file",
             side_effect=RuntimeError("injected canary failure"),
         ):
-            activated, backup = ssh_canary.activate(self.db, self.target, log=self.log)
+            with self.quiet():
+                activated, backup = ssh_canary.activate(
+                    self.db, self.target, log=self.log
+                )
         self.assertFalse(activated)
         self.assertIsNone(backup)
         self.assertEqual((self.ssh / "id_ed25519").read_bytes(), original)

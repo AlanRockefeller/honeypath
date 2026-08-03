@@ -22,6 +22,7 @@ import stat
 import sys
 import ctypes
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -34,9 +35,72 @@ _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
 TEMP_PREFIX = ".honeypath-tmp-"
 
+_LIBC: ctypes.CDLL | None = None
+_LIBC_PROTOTYPES = {
+    "renameat2": (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ),
+    "renameatx_np": (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ),
+    "linkat": (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ),
+}
+
+
+def _libc() -> ctypes.CDLL:
+    """One process-wide libc handle with the syscall prototypes declared.
+
+    Without argtypes ctypes guesses each argument's width, which is exactly the
+    wrong thing to leave implicit for calls whose correctness decides whether a
+    rename replaces a file.  Declaring them once also avoids re-opening libc on
+    every safe rename.
+    """
+    global _LIBC
+    if _LIBC is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        for name, argtypes in _LIBC_PROTOTYPES.items():
+            func = getattr(libc, name, None)
+            if func is not None:
+                func.argtypes = list(argtypes)
+                func.restype = ctypes.c_int
+        _LIBC = libc
+    return _LIBC
+
 
 class SafeWriteError(Exception):
     """An operation could not be completed with the required guarantees."""
+
+
+class InstallHookError(Exception):
+    """An ``on_installed`` hook rejected a write that has since been undone.
+
+    Deliberately *not* a :class:`SafeWriteError`: the filesystem did everything
+    it was asked to, and callers that turn a ``SafeWriteError`` into "this path
+    was refused" must not swallow a caller's own rejection.
+    """
+
+
+class RollbackError(SafeWriteError):
+    """A rejected installation could not be undone.
+
+    The destination may now hold content that no caller committed to, so this
+    is reported separately from an ordinary refusal and always demands
+    operator attention.
+    """
 
 
 def resolve_root(root: Path | str) -> Path:
@@ -190,7 +254,7 @@ def rename_noreplace(source: Path, destination: Path, *, root: Path | str) -> No
 
 
 def _renameat_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
+    libc = _libc()
     src_b, dst_b = os.fsencode(src), os.fsencode(dst)
     if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
         result = libc.renameat2(
@@ -225,7 +289,7 @@ def _renameat_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
 
 def _renameat_exchange(parent_fd: int, first: str, second: str) -> None:
     """Atomically exchange two names in one already-open Linux directory."""
-    libc = ctypes.CDLL(None, use_errno=True)
+    libc = _libc()
     if not sys.platform.startswith("linux") or not hasattr(libc, "renameat2"):
         raise SafeWriteError("this platform cannot guarantee managed compare-and-swap")
     result = libc.renameat2(
@@ -244,9 +308,20 @@ def _renameat_exchange(parent_fd: int, first: str, second: str) -> None:
         raise OSError(error, os.strerror(error), second)
 
 
+def supports_unnamed_temporary() -> bool:
+    """True when this kernel can create an inode that has no directory name.
+
+    Only Linux implements ``O_TMPFILE`` plus ``linkat(AT_EMPTY_PATH)``, the pair
+    that lets Honeypath install the exact inode it just wrote.  Callers use this
+    to decide *in advance* whether the portable creation path is the only one
+    available on the host, rather than discovering it from a failed write.
+    """
+    return bool(_O_TMPFILE) and sys.platform.startswith("linux")
+
+
 def _open_unnamed_temporary(parent_fd: int, path: Path) -> int:
     """Create an inode with no directory name; fail closed if unsupported."""
-    if not _O_TMPFILE or not sys.platform.startswith("linux"):
+    if not supports_unnamed_temporary():
         raise SafeWriteError(
             f"cannot safely install {path}: unnamed temporary files are unsupported"
         )
@@ -272,7 +347,7 @@ def _open_unnamed_temporary(parent_fd: int, path: Path) -> int:
 
 def _link_open_fd_noreplace(fd: int, parent_fd: int, name: str) -> None:
     """Link the exact open unnamed inode, never a re-resolved source name."""
-    libc = ctypes.CDLL(None, use_errno=True)
+    libc = _libc()
     if not hasattr(libc, "linkat"):
         raise SafeWriteError("linkat(AT_EMPTY_PATH) is unavailable")
     result = libc.linkat(
@@ -302,7 +377,9 @@ def _link_open_fd_noreplace(fd: int, parent_fd: int, name: str) -> None:
             except FileExistsError:
                 raise
             except OSError as fallback:
-                error = fallback.errno
+                # A rare OSError carries no errno; os.strerror(None) would
+                # raise TypeError and bury the real failure.
+                error = fallback.errno if fallback.errno is not None else errno.EIO
         if error in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.EPERM):
             raise SafeWriteError(
                 "the filesystem cannot link an unnamed temporary inode safely"
@@ -312,6 +389,45 @@ def _link_open_fd_noreplace(fd: int, parent_fd: int, name: str) -> None:
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _undo_exchange(
+    parent_fd: int,
+    stage_name: str,
+    name: str,
+    installed: os.stat_result,
+    exchanged: os.stat_result,
+    temp_info: os.stat_result,
+    path: Path,
+) -> bool:
+    """Put the replaced inode back at ``name``.
+
+    Only performed while both names still identify the objects observed
+    immediately after the exchange: anything else means a third party is moving
+    these entries, and guessing would be worse than stopping.  Returns ``True``
+    when the rejected new inode was also removed, so the caller knows the
+    staging name no longer needs cleaning up.
+    """
+    now_final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    now_stage = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _same_identity(now_final, installed) or not _same_identity(
+        now_stage, exchanged
+    ):
+        raise RollbackError(
+            f"FATAL: managed replacement race at {path}; automatic rollback "
+            f"cannot identify both exchanged entries"
+        )
+    _renameat_exchange(parent_fd, stage_name, name)
+    restored = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    staged = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _same_identity(restored, exchanged) or not _same_identity(staged, installed):
+        raise RollbackError(
+            f"FATAL: managed replacement rollback identity failed at {path}"
+        )
+    if _same_identity(staged, temp_info):
+        _unlink_if_identity(parent_fd, stage_name, staged)
+        return True
+    return False
 
 
 def _stat_optional(parent_fd: int, name: str) -> os.stat_result | None:
@@ -488,6 +604,7 @@ def atomic_write(
     replace: bool = True,
     expected_sha256: str | None = None,
     allow_exclusive_create_fallback: bool = False,
+    on_installed: Callable[[], None] | None = None,
 ) -> list[str]:
     """Atomically write below an anchored root.
 
@@ -501,10 +618,17 @@ def atomic_write(
     reproducible file.  That fallback still uses O_EXCL, O_NOFOLLOW and an
     anchored directory descriptor, so it can never overwrite an existing
     credential; only all-at-once content visibility is relaxed.
+
+    ``on_installed`` runs once the destination name refers to the new inode but
+    *before* the replaced one is discarded, with the parent descriptor still
+    open.  Raising from it undoes the installation — the previous inode is
+    exchanged back, or a first creation is unlinked — and re-raises, which is
+    how a caller keeps its own record of the write in step with the filesystem.
+    A rollback that cannot itself be completed raises :class:`RollbackError`.
     """
     if isinstance(data, str):
         data = data.encode("utf-8")
-    warnings: list[str] = []
+    problems: list[str] = []
     with anchored_parent(path, root) as (parent_fd, name):
         current = _stat_optional(parent_fd, name)
         if current is not None:
@@ -535,6 +659,7 @@ def atomic_write(
                 fsync_data=fsync_data,
                 fsync_dir=fsync_dir,
                 best_effort_metadata=best_effort_metadata,
+                on_installed=on_installed,
             )
         stage_name: str | None = None
         check_fd = -1
@@ -545,18 +670,18 @@ def atomic_write(
             except OSError as exc:
                 if not best_effort_metadata:
                     raise
-                warnings.append(f"chmod {oct(mode)} {path}: {exc}")
+                problems.append(f"chmod {oct(mode)} {path}: {exc}")
             if uid is not None and gid is not None and os.geteuid() == 0:
                 try:
                     os.fchown(fd, uid, gid)
                 except OSError as exc:
                     if not best_effort_metadata:
                         raise
-                    warnings.append(f"chown {uid}:{gid} {path}: {exc}")
+                    problems.append(f"chown {uid}:{gid} {path}: {exc}")
             if fsync_data:
                 problem = _fsync_fd(fd, str(path))
                 if problem:
-                    warnings.append(problem)
+                    problems.append(problem)
 
             temp_info = os.fstat(fd)
 
@@ -590,6 +715,19 @@ def atomic_write(
                     raise SafeWriteError(
                         f"installed inode identity mismatch for {path}"
                     )
+                if on_installed is not None:
+                    try:
+                        on_installed()
+                    except BaseException as rejection:
+                        try:
+                            _unlink_if_identity(parent_fd, name, temp_info)
+                        except (OSError, SafeWriteError) as failure:
+                            raise RollbackError(
+                                f"FATAL: {path} was created, the creation was rejected "
+                                f"({rejection}), and the file could not be removed "
+                                f"again: {failure}"
+                            ) from rejection
+                        raise
             else:
                 for _ in range(32):
                     candidate = _random_temp_name()
@@ -612,37 +750,50 @@ def atomic_write(
                     exchanged, expected_old
                 ):
                     # The staged or destination name changed after verification.
-                    # Exchange back only while both names still identify the
-                    # objects observed immediately after the failed CAS.
-                    now_final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                    now_stage = os.stat(
-                        stage_name, dir_fd=parent_fd, follow_symlinks=False
-                    )
-                    if not _same_identity(now_final, installed) or not _same_identity(
-                        now_stage, exchanged
+                    if _undo_exchange(
+                        parent_fd,
+                        stage_name,
+                        name,
+                        installed,
+                        exchanged,
+                        temp_info,
+                        Path(path),
                     ):
-                        raise SafeWriteError(
-                            f"FATAL: managed replacement race at {path}; automatic rollback "
-                            f"cannot identify both exchanged entries"
-                        )
-                    _renameat_exchange(parent_fd, stage_name, name)
-                    restored = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                    staged = os.stat(
-                        stage_name, dir_fd=parent_fd, follow_symlinks=False
-                    )
-                    if not _same_identity(restored, exchanged) or not _same_identity(
-                        staged, installed
-                    ):
-                        raise SafeWriteError(
-                            f"FATAL: managed replacement rollback identity failed at {path}"
-                        )
-                    if _same_identity(staged, temp_info):
-                        _unlink_if_identity(parent_fd, stage_name, staged)
                         stage_name = None
                     raise SafeWriteError(
                         f"refusing replacement of {path}: destination or staging entry "
                         "changed after verification"
                     )
+                if on_installed is not None:
+                    # The replaced inode is still staged, so a caller that
+                    # cannot commit its own record of this write gets the old
+                    # file back rather than an unrecorded new one.
+                    try:
+                        on_installed()
+                    except BaseException as rejection:
+                        try:
+                            cleared = _undo_exchange(
+                                parent_fd,
+                                stage_name,
+                                name,
+                                installed,
+                                exchanged,
+                                temp_info,
+                                Path(path),
+                            )
+                        except (OSError, SafeWriteError) as failure:
+                            # The previous inode is still linked under the
+                            # staging name, so name it: that entry is the only
+                            # remaining handle on the original file.
+                            raise RollbackError(
+                                f"FATAL: {path} was replaced, the replacement was "
+                                f"rejected ({rejection}), and the previous file could "
+                                f"not be put back: {failure}. The original is still "
+                                f"linked as {Path(path).parent / stage_name}"
+                            ) from rejection
+                        if cleared:
+                            stage_name = None
+                        raise
                 _unlink_if_identity(parent_fd, stage_name, exchanged)
                 stage_name = None
         finally:
@@ -662,8 +813,8 @@ def atomic_write(
         if fsync_dir:
             problem = _fsync_fd(parent_fd, str(Path(path).parent))
             if problem:
-                warnings.append(problem)
-    return warnings
+                problems.append(problem)
+    return problems
 
 
 def _exclusive_write_new(
@@ -678,9 +829,10 @@ def _exclusive_write_new(
     fsync_data: bool,
     fsync_dir: bool,
     best_effort_metadata: bool,
+    on_installed: Callable[[], None] | None = None,
 ) -> list[str]:
     """Descriptor-anchored no-clobber creation for DrvFS-style filesystems."""
-    warnings: list[str] = []
+    problems: list[str] = []
     try:
         fd = os.open(
             name,
@@ -700,18 +852,18 @@ def _exclusive_write_new(
         except OSError as exc:
             if not best_effort_metadata:
                 raise
-            warnings.append(f"chmod {oct(mode)} {path}: {exc}")
+            problems.append(f"chmod {oct(mode)} {path}: {exc}")
         if uid is not None and gid is not None and os.geteuid() == 0:
             try:
                 os.fchown(fd, uid, gid)
             except OSError as exc:
                 if not best_effort_metadata:
                     raise
-                warnings.append(f"chown {uid}:{gid} {path}: {exc}")
+                problems.append(f"chown {uid}:{gid} {path}: {exc}")
         if fsync_data:
             problem = _fsync_fd(fd, str(path))
             if problem:
-                warnings.append(problem)
+                problems.append(problem)
         installed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_identity(installed, created):
             raise SafeWriteError(f"installed inode identity mismatch for {path}")
@@ -721,13 +873,27 @@ def _exclusive_write_new(
         except (OSError, SafeWriteError):
             pass
         raise
+    else:
+        if on_installed is not None:
+            try:
+                on_installed()
+            except BaseException as rejection:
+                try:
+                    _unlink_if_identity(parent_fd, name, created)
+                except (OSError, SafeWriteError) as failure:
+                    raise RollbackError(
+                        f"FATAL: {path} was created, the creation was rejected "
+                        f"({rejection}), and the file could not be removed again: "
+                        f"{failure}"
+                    ) from rejection
+                raise
     finally:
         os.close(fd)
     if fsync_dir:
         problem = _fsync_fd(parent_fd, str(path.parent))
         if problem:
-            warnings.append(problem)
-    return warnings
+            problems.append(problem)
+    return problems
 
 
 def atomic_copy(
@@ -779,7 +945,7 @@ def safe_mkdir(
 ) -> list[str]:
     """Create a directory chain using mkdirat/openat and descriptor metadata."""
     root_real, parts = _relative_parts(path, root)
-    warnings: list[str] = []
+    problems: list[str] = []
     fds: list[int] = [_open_root(root_real)]
     try:
         display = root_real
@@ -810,14 +976,14 @@ def safe_mkdir(
                 except OSError as exc:
                     if not best_effort_metadata:
                         raise
-                    warnings.append(f"chmod {oct(mode)} {display}: {exc}")
+                    problems.append(f"chmod {oct(mode)} {display}: {exc}")
                 if uid is not None and gid is not None and os.geteuid() == 0:
                     try:
                         os.fchown(child, uid, gid)
                     except OSError as exc:
                         if not best_effort_metadata:
                             raise
-                        warnings.append(f"chown {uid}:{gid} {display}: {exc}")
+                        problems.append(f"chown {uid}:{gid} {display}: {exc}")
                 now = os.stat(part, dir_fd=fds[-2], follow_symlinks=False)
                 opened = os.fstat(child)
                 if (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino):
@@ -826,14 +992,14 @@ def safe_mkdir(
                     )
                 problem = _fsync_fd(fds[-2], str(display.parent))
                 if problem:
-                    warnings.append(problem)
+                    problems.append(problem)
     finally:
         for fd in reversed(fds):
             try:
                 os.close(fd)
             except OSError:
                 pass
-    return warnings
+    return problems
 
 
 def create_directory_exclusive(

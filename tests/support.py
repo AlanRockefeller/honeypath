@@ -11,8 +11,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from honeypath import alerts as _alerts  # noqa: E402
 from honeypath.database import Database  # noqa: E402
 from honeypath.target_user import TargetUserContext  # noqa: E402
+
+# A bare ``Pushover()`` reads /etc/honeypath, so on a machine where Honeypath is
+# actually configured, any test that forgets to inject a fake pushes a synthetic
+# alert to the operator's real phone.  Point the credentials somewhere that
+# cannot exist before a single test constructs one.
+_NO_CREDENTIALS = Path(tempfile.gettempdir()) / "honeypath-tests-no-credentials"
+_alerts.CONFIG_DIR = _NO_CREDENTIALS
+_alerts.TOKEN_FILE = _NO_CREDENTIALS / "pushover-token"
+_alerts.USER_FILE = _NO_CREDENTIALS / "pushover-user"
 
 
 class TempHomeCase(unittest.TestCase):
@@ -34,6 +44,13 @@ class TempHomeCase(unittest.TestCase):
         self.log_lines: list[str] = []
 
     def tearDown(self) -> None:
+        # The writer thread and its connection outlive the temp directory
+        # otherwise, and a test that leaves the queue running can have its
+        # writes land after the files it wrote them for are gone.
+        try:
+            self.db.close()
+        except Exception:
+            pass
         self._tmp.cleanup()
 
     def log(self, *args) -> None:

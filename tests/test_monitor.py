@@ -36,12 +36,12 @@ class CoalescerTests(unittest.TestCase):
         coalescer.add(hit("/x/id_rsa", "inotify", at=1000.0))
         coalescer.add(hit("/x/id_rsa", "atime", at=1000.5))
         coalescer.add(
-            hit("/x/id_rsa", "win-audit", at=1001.0, process_info="C:\\evil.exe")
+            hit("/x/id_rsa", "win-audit", at=1001.0, process_info="C:\\test.exe")
         )
         due = coalescer.due(now=1003.0)
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0].methods, ["inotify", "atime", "win-audit"])
-        self.assertEqual(due[0].process_info, "C:\\evil.exe")
+        self.assertEqual(due[0].process_info, "C:\\test.exe")
 
     def test_different_paths_stay_separate(self):
         coalescer = monitor_mod.Coalescer(window=2.0)
@@ -230,7 +230,7 @@ class AtimeWatcherTests(TempHomeCase):
             st = os.stat(path)
             os.utime(path, ns=(st.st_atime_ns + 10_000_000_000, st.st_mtime_ns))
             watcher.poll_once()
-            time.sleep(0.3)
+            writer.drain()
         finally:
             writer.stop()
         row = self.db.get_canary_by_path(str(path))
@@ -389,8 +389,9 @@ class MonitorDispatchTests(TempHomeCase):
         try:
             monitor.hits.put(hit(str(path), "inotify", at=time.time()))
             monitor.pump(0.4)
-            time.sleep(0.4)
         finally:
+            # stop() drains the hit queue, the sweep aggregator, the writer and
+            # the alert thread, so no fixed sleep is needed to see the results.
             monitor.stop()
         events = self.db.recent_events(limit=10)
         self.assertEqual(len(events), 1)
@@ -445,7 +446,6 @@ class MonitorDispatchTests(TempHomeCase):
             for offset in (0, 5):
                 monitor.hits.put(hit(str(path), "inotify", at=time.time() + offset))
                 monitor.pump(0.3)
-            time.sleep(0.4)
         finally:
             monitor.stop()
         events = self.db.recent_events(limit=10)
@@ -461,7 +461,6 @@ class MonitorDispatchTests(TempHomeCase):
         try:
             monitor.hits.put(hit(str(path), "inotify", at=time.time()))
             monitor.pump(0.3)
-            time.sleep(0.3)
         finally:
             monitor.stop()
         events = self.db.recent_events(limit=10)
@@ -477,7 +476,6 @@ class MonitorDispatchTests(TempHomeCase):
                 hit(str(path), "inotify", monitor_mod.EVENT_RECREATED, at=time.time())
             )
             monitor.pump(0.3)
-            time.sleep(0.3)
         finally:
             monitor.stop()
         self.assertEqual(len(self.db.recent_events(limit=10)), 1)
@@ -492,16 +490,15 @@ class MonitorDispatchTests(TempHomeCase):
                     str(path),
                     "win-audit",
                     at=time.time(),
-                    process_info="C:\\Users\\alanr\\evil.exe pid=42",
+                    process_info="C:\\Users\\alanr\\test.exe pid=42",
                 )
             )
             monitor.pump(0.3)
-            time.sleep(0.3)
         finally:
             monitor.stop()
         events = self.db.recent_events(limit=10)
-        self.assertIn("evil.exe", events[0]["process_info"])
-        self.assertIn("evil.exe", pushover.sent[0])
+        self.assertIn("test.exe", events[0]["process_info"])
+        self.assertIn("test.exe", pushover.sent[0])
 
     def test_stop_drains_hit_queued_immediately_before_shutdown(self):
         monitor, _, path = self.build(dedup_window=120.0)

@@ -156,13 +156,13 @@ class LogInjectionTests(TempHomeCase):
         before = len((self.root / "honeypath.log").read_text().splitlines())
         log.detection(
             detection_event(
-                process_info="C:\\evil.exe\n2026-01-01 00:00:00Z  INFO   all clear",
+                process_info="C:\\test.exe\n2026-01-01 00:00:00Z  INFO   all clear",
             )
         )
         lines = (self.root / "honeypath.log").read_text().splitlines()
         self.assertEqual(len(lines) - before, 1)
         self.assertIn("\\n", lines[-1])
-        self.assertIn("C:\\evil.exe", lines[-1])
+        self.assertIn("C:\\test.exe", lines[-1])
 
     def test_control_characters_are_escaped(self):
         self.assertEqual(eventlog.sanitize("a\nb"), "a\\nb")
@@ -369,8 +369,9 @@ class MonitorLoggingTests(TempHomeCase):
                 )
             )
             monitor.pump(0.4)
-            time.sleep(0.4)
         finally:
+            # stop() drains the hit queue, the sweep aggregator, the writer and
+            # the alert thread, so no fixed sleep is needed to see the results.
             monitor.stop()
 
     def test_a_detection_and_its_delivery_are_both_logged(self):

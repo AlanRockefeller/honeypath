@@ -41,6 +41,8 @@ StateDirectoryMode=0700
 # or
 #     sudo chown alan:alan /etc/honeypath/pushover-token /etc/honeypath/pushover-user
 #     sudo chmod 0600 /etc/honeypath/pushover-token /etc/honeypath/pushover-user
+#     sudo chown root:alan /etc/honeypath
+#     sudo chmod 0750 /etc/honeypath
 
 # Hardening. Deliberately NOT set: ProtectHome / PrivateUsers /
 # ProtectSystem=strict, any of which would stop Honeypath reading the very
