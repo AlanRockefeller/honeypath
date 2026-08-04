@@ -367,7 +367,7 @@ class ServiceStateAccessTests(TempHomeCase):
     def test_a_database_owned_by_another_user_is_reported(self):
         # The directory has to be usable by svc, or the check stops there and
         # the database file is never reached.
-        os.chmod(self.db.path.parent, 0o777)
+        os.chmod(self.db.path.parent, 0o733)
         os.chmod(self.db.path, 0o600)
         problem = cli.service_state_access(self.db, self.other_user())
         self.assertIsNotNone(problem)

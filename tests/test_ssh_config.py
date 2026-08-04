@@ -401,6 +401,16 @@ class ResolveSshBinaryTests(TempHomeCase):
         self.assertNotEqual(resolved, str(stray / "ssh"))
         self.assertEqual(resolved, ssh_canary.SSH_BINARIES["ssh"])
 
+    def test_a_wrapper_does_not_hide_a_real_binary_later_on_path(self):
+        stray = self.home / "somewhere"
+        self.wrapper(stray)
+        directory = self.home / "opt"
+        directory.mkdir()
+        real = directory / "ssh"
+        real.write_text('#!/bin/sh\nexec /usr/bin/ssh "$@"\n')
+        real.chmod(0o755)
+        self.assertEqual(self.resolve([stray, directory]), str(real))
+
     def test_a_real_binary_on_path_is_returned(self):
         directory = self.home / "opt"
         directory.mkdir()
@@ -437,6 +447,25 @@ class StripRcBlockTests(unittest.TestCase):
         self.assertIn("export EDITOR=vi", cleaned)
         self.assertIn("alias ll='ls -l'", cleaned)
         self.assertIn("$HOME/bin", cleaned)
+
+    def test_a_second_begin_marker_keeps_the_content_between_them(self):
+        """Nested markers are hand-edited damage, not content to swallow."""
+        text = (
+            "export EDITOR=vi\n"
+            f"{ssh_canary.RC_BEGIN}\n"
+            "export MINE=1\n"
+            f"{ssh_canary.RC_BEGIN}\n"
+            'export PATH="$HOME/bin:$PATH"\n'
+            f"{ssh_canary.RC_END}\n"
+            "alias ll='ls -l'\n"
+        )
+        cleaned = ssh_canary._strip_rc_block(text)
+        self.assertIn("export MINE=1", cleaned)
+        self.assertIn(f"{ssh_canary.RC_BEGIN}\n", cleaned)
+        self.assertEqual(cleaned.count(ssh_canary.RC_BEGIN), 1)
+        self.assertNotIn("$HOME/bin", cleaned)
+        self.assertIn("export EDITOR=vi", cleaned)
+        self.assertIn("alias ll='ls -l'", cleaned)
 
 
 if __name__ == "__main__":

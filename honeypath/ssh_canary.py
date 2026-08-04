@@ -108,10 +108,14 @@ def resolve_ssh_binary(name: str = "ssh", *, exclude: Path | None = None) -> str
         for directory in os.environ.get("PATH", os.defpath).split(os.pathsep)
         if directory and (excluded is None or _resolved(Path(directory)) != excluded)
     ]
-    found = shutil.which(name, path=os.pathsep.join(search))
-    if found and _is_wrapper(Path(found)):
-        found = None
-    return found or SSH_BINARIES.get(name, SSH_BINARY)
+    for directory in search:
+        found = shutil.which(name, path=directory)
+        # A wrapper only disqualifies its own directory: the genuine binary is
+        # very often further along PATH, and stopping at the first match would
+        # fall back to /usr/bin even when the real ssh is right there.
+        if found and not _is_wrapper(Path(found)):
+            return found
+    return SSH_BINARIES.get(name, SSH_BINARY)
 
 
 def _resolved(directory: Path) -> Path:
@@ -1399,18 +1403,24 @@ def _strip_rc_block(text: str) -> str:
     out: list[str] = []
     seams: list[int] = []
     held: list[str] = []
-    skipping = False
+    begin: str | None = None
     for line in text.splitlines(keepends=True):
         if line.strip() == RC_BEGIN:
-            skipping = True
+            if begin is not None:
+                # A second BEGIN before any END: the first marker never opened
+                # a block Honeypath can recognise, so its marker line and
+                # everything under it go back exactly as they were found.
+                out.append(begin)
+                out.extend(held)
+            begin = line
             held = []
             continue
         if line.strip() == RC_END:
-            skipping = False
+            begin = None
             held = []
             seams.append(len(out))
             continue
-        if skipping:
+        if begin is not None:
             held.append(line)
         else:
             out.append(line)

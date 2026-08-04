@@ -102,6 +102,17 @@ class AtomicWriteTests(TempHomeCase):
         """
         if not safe_write.supports_unnamed_temporary():
             self.skipTest("no O_TMPFILE here; managed replacement is unavailable")
+        # Kernel support is not filesystem support: overlayfs and friends
+        # refuse O_TMPFILE, so the home under test is probed itself.
+        probe_fd = os.open(self.home, os.O_RDONLY)
+        try:
+            fd = safe_write._open_unnamed_temporary(probe_fd, self.home / ".probe")
+        except safe_write.SafeWriteError as exc:
+            self.skipTest(f"no O_TMPFILE on this filesystem: {exc}")
+        else:
+            os.close(fd)
+        finally:
+            os.close(probe_fd)
         first, second = self.home / ".cas-probe-a", self.home / ".cas-probe-b"
         first.write_text("a")
         second.write_text("b")
@@ -175,6 +186,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertNotEqual(os.lstat(path).st_ino, original_inode)
 
     def test_on_installed_sees_the_new_content_before_it_commits(self):
+        self.require_cas_replacement()
         path = self.home / ".netrc"
         path.write_text("old\n")
         seen: list[str] = []
@@ -307,6 +319,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertTrue(trap.is_symlink())
 
     def test_temporary_names_are_unpredictable_and_distinct(self):
+        self.require_cas_replacement()
         seen = set()
         directory = self.home / "probe"
         directory.mkdir()
@@ -352,6 +365,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(self._temporaries(self.home), [])
 
     def test_a_failure_during_replace_leaves_no_temporary_behind(self):
+        self.require_cas_replacement()
         path = self.home / ".netrc"
         path.write_text("old")
 
@@ -403,6 +417,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_refresh_symlink_race_never_touches_symlink_target(self):
+        self.require_cas_replacement()
         path = self.home / "managed"
         path.write_text("old")
         victim = self.root / "victim"
@@ -429,6 +444,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(victim.read_text(), "SECRET")
 
     def test_observed_staging_name_cannot_substitute_payload(self):
+        self.require_cas_replacement()
         path = self.home / "managed"
         path.write_text("old")
         expected = hashlib.sha256(b"old").hexdigest()
@@ -467,6 +483,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(leftovers[0].read_text(), "ATTACKER")
 
     def test_destination_changed_after_hash_is_restored_not_overwritten(self):
+        self.require_cas_replacement()
         path = self.home / "managed"
         path.write_text("old")
         expected = hashlib.sha256(b"old").hexdigest()
