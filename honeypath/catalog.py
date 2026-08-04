@@ -1320,14 +1320,6 @@ def _ancestor_chain(directory: Path, root: Path | str) -> list[Path]:
     return [base.joinpath(*parts[: i + 1]) for i in range(len(parts))]
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def render_content(entry: CanaryEntry, *, canarytoken: dict | None = None) -> str:
     """Materialise an entry's content, applying any Canarytoken splice."""
     if canarytoken and entry.kind == "aws_credentials":

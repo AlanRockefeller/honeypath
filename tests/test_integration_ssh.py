@@ -22,7 +22,7 @@ from unittest import mock
 
 from .support import TempHomeCase
 
-from honeypath import ssh_canary  # noqa: E402
+from honeypath import safe_write, ssh_canary  # noqa: E402
 
 INTERESTING = {
     "user",
@@ -222,7 +222,7 @@ class SshCanaryIntegrationTests(TempHomeCase):
     def test_reactivation_is_impossible_and_preserves_real_key_hashes_and_backup(self):
         self.phase_one()
         relocated_key = ssh_canary.relocated_dir(self.home) / "id_ed25519"
-        before = ssh_canary.sha256_file(relocated_key)
+        before = safe_write.sha256_anchored(relocated_key, root=self.home)
         with self.quiet():
             activated, backup = ssh_canary.activate(self.db, self.target, log=self.log)
         self.assertTrue(activated)
@@ -233,7 +233,9 @@ class SshCanaryIntegrationTests(TempHomeCase):
                 self.db, self.target, force=True, log=self.log
             )
         self.assertFalse(second)
-        self.assertEqual(ssh_canary.sha256_file(relocated_key), before)
+        self.assertEqual(
+            safe_write.sha256_anchored(relocated_key, root=self.home), before
+        )
         self.assertEqual(
             self.db.get_ssh_installation(self.home)["backup_path"], str(backup)
         )

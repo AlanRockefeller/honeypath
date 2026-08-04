@@ -13,7 +13,7 @@ from unittest import mock
 from .support import TempHomeCase
 
 from honeypath import safe_write, ssh_canary  # noqa: E402
-from honeypath.catalog import sha256_file, sha256_text  # noqa: E402
+from honeypath.catalog import sha256_text  # noqa: E402
 
 
 class InventoryTests(TempHomeCase):
@@ -199,7 +199,8 @@ class WrapperTests(TempHomeCase):
         self.assertEqual(len(changes), 3)
         for change in changes:
             self.assertEqual(
-                sha256_file(Path(change["target"])), change["content_hash"]
+                safe_write.sha256_anchored(Path(change["target"]), root=self.home),
+                change["content_hash"],
             )
 
     def test_foreign_file_is_refused(self):
@@ -502,11 +503,13 @@ class ActivationTests(TempHomeCase):
         self.assertTrue(ok)
         assert backup is not None
         relocated_key = ssh_canary.relocated_dir(self.home) / "id_rsa"
-        before = sha256_file(relocated_key)
+        before = safe_write.sha256_anchored(relocated_key, root=self.home)
         (self.ssh / "id_rsa").write_text("FAKE SECOND CANARY")
         ok2, _ = self.activate(force=True)
         self.assertFalse(ok2)
-        self.assertEqual(sha256_file(relocated_key), before)
+        self.assertEqual(
+            safe_write.sha256_anchored(relocated_key, root=self.home), before
+        )
         installation = self.db.get_ssh_installation(self.home)
         self.assertEqual(installation["backup_path"], str(backup))
 

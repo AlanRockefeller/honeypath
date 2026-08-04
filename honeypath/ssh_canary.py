@@ -41,7 +41,6 @@ from .catalog import (
     PLATFORM_LINUX,
     create_canary_file,
     managed_marker,
-    sha256_file,
     sha256_text,
     ssh_entries,
 )
