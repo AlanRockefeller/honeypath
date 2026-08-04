@@ -288,19 +288,37 @@ def _offer_elevation(log, confirm, relaunch_extra: Sequence[str]) -> int:
 FILE_SYSTEM_SUBCATEGORY_GUID = "{0CCE921D-69AE-11D9-BED3-505054503030}"
 _SUBCATEGORY_ARG = f"/subcategory:{FILE_SYSTEM_SUBCATEGORY_GUID}"
 
+# auditpol's numeric "Setting Value" column: bit 0 is Success, bit 1 Failure.
+POLICY_SUCCESS_BIT = 1
 
-def audit_policy_state() -> tuple[str | None, str | None]:
+
+def audit_policy_state() -> tuple[str | None, bool | None, str | None]:
+    """``(display, success_included, error)`` for the File System subcategory.
+
+    ``display`` is what the operator reads and what restore compares against,
+    so it stays verbatim.  The decision of whether Success auditing is on comes
+    from the numeric "Setting Value" column instead: the inclusion setting is
+    translated, and matching the English word "Success" on a localized Windows
+    reads a perfectly good policy as "auditing is off".  ``None`` means the
+    numeric column was absent and the answer is unknown.
+    """
     # /r emits CSV, so the row is located by GUID column rather than by a
     # localized label.
     result = run_interop(["auditpol.exe", "/get", _SUBCATEGORY_ARG, "/r"])
     if not result.ok:
-        return None, result.error or result.stderr.strip() or "auditpol failed"
+        return None, None, result.error or result.stderr.strip() or "auditpol failed"
     guid = FILE_SYSTEM_SUBCATEGORY_GUID.lower()
     for row in csv.reader(io.StringIO(result.stdout)):
         if len(row) < 5 or row[3].strip().lower() != guid:
             continue
-        return f"{row[2].strip()}: {row[4].strip()}", None
-    return result.stdout.strip() or None, None
+        included: bool | None = None
+        if len(row) >= 7:
+            try:
+                included = bool(int(row[6].strip()) & POLICY_SUCCESS_BIT)
+            except ValueError:
+                included = None
+        return f"{row[2].strip()}: {row[4].strip()}", included, None
+    return result.stdout.strip() or None, None, None
 
 
 def enable_audit_policy() -> tuple[bool, str]:
@@ -481,7 +499,7 @@ def collect_status(db: Database, windows_home: Path | None) -> WindowsAuditStatu
         return status
 
     status.elevated = is_elevated()
-    status.audit_policy, status.audit_policy_error = audit_policy_state()
+    status.audit_policy, _included, status.audit_policy_error = audit_policy_state()
     status.security_log_readable, status.security_log_error = security_log_readable()
     status.fsutil_value, status.fsutil_error = fsutil_disablelastaccess()
     status.scheduled_task = scheduled_task_state()
@@ -545,7 +563,7 @@ def setup_windows_audit(
         log("Aborted.")
         return 1
 
-    original_policy, original_policy_error = audit_policy_state()
+    original_policy, original_included, original_policy_error = audit_policy_state()
     if original_policy is None or original_policy_error:
         log(
             "Policy pre-state captured: NO — "
@@ -559,8 +577,8 @@ def setup_windows_audit(
     if not ok:
         log("No SACLs were changed because required audit-policy setup failed.")
         return 1
-    verified_policy, verify_error = audit_policy_state()
-    policy_verified = bool(verified_policy and "Success" in verified_policy)
+    verified_policy, verified_included, verify_error = audit_policy_state()
+    policy_verified = verified_included is True
     log(
         f"Policy verified: {'YES' if policy_verified else 'NO'} — "
         f"{verified_policy or verify_error or 'required Success state absent'}"
@@ -576,7 +594,7 @@ def setup_windows_audit(
     db.record_managed_change(
         change_type=CHANGE_AUDIT_POLICY,
         target="File System/Success",
-        previous_existed=bool(original_policy and "Success" in original_policy),
+        previous_existed=bool(original_included),
         previous_value=original_policy or original_policy_error,
         new_value=verified_policy,
         notes="auditpol enable succeeded and was verified",
@@ -773,7 +791,18 @@ while ($true) {{
         }} -ErrorAction Stop | Out-Null
       }} catch {{ $remaining.Add($line) }}
     }}
-    if ($remaining.Count) {{ Set-Content -Path $QueueFile -Value $remaining }}
+    # Rewritten through a sibling temporary file: a crash or a full disk
+    # partway through a direct Set-Content would truncate the queue and lose
+    # every undelivered detection in it.
+    if ($remaining.Count) {{
+      $tmpQueue = $QueueFile + '.tmp'
+      try {{
+        Set-Content -Path $tmpQueue -Value $remaining -ErrorAction Stop
+        Move-Item -Path $tmpQueue -Destination $QueueFile -Force -ErrorAction Stop
+      }} catch {{
+        Remove-Item -Path $tmpQueue -Force -ErrorAction SilentlyContinue
+      }}
+    }}
     else {{ Remove-Item -Path $QueueFile -Force }}
   }}
   Start-Sleep -Seconds 60
@@ -992,7 +1021,7 @@ def restore_windows_audit_policy(
         if dry_run:
             log("  [dry-run] would restore the recorded File System audit-policy state")
             continue
-        current, error = audit_policy_state()
+        current, _current_included, error = audit_policy_state()
         expected = change.get("new_value")
         if error or current != expected:
             log(
@@ -1005,9 +1034,14 @@ def restore_windows_audit_policy(
             db.retire_managed_change(change["id"])
             continue
         ok, detail = disable_success_audit_policy()
-        verify, verify_error = audit_policy_state()
-        restored = ok and not (verify and "Success" in verify)
-        log(f"  audit policy: {'restored' if restored else detail or verify_error}")
+        verify, verify_included, verify_error = audit_policy_state()
+        # Locale-independent, and "unknown" is not "restored": a policy that
+        # cannot be read back is left recorded so restore can be retried.
+        restored = ok and verify_included is False
+        log(
+            "  audit policy: "
+            + ("restored" if restored else (detail or verify_error or verify or "?"))
+        )
         if restored:
             db.retire_managed_change(change["id"])
 
@@ -1200,6 +1234,7 @@ class WinAuditWatcher(Watcher):
                 break
             ordered = sorted(records, key=lambda r: int(r.get("RecordId") or 0))
             progressed = False
+            staged_hit = False
             for record in ordered:
                 record_id = int(record.get("RecordId") or 0)
                 if record_id <= self.last_record_id:
@@ -1233,8 +1268,13 @@ class WinAuditWatcher(Watcher):
                 )
                 self.last_record_id = record_id
                 if hit is not None:
-                    emitted += self._emit_pending_inbox(catch_up=catch_up)
+                    staged_hit = True
                 progressed = True
+            # One drain per page rather than one per matching record: the
+            # inbox is emptied either way, and a page full of hits would
+            # otherwise rescan it once for every row.
+            if staged_hit:
+                emitted += self._emit_pending_inbox(catch_up=catch_up)
             if not progressed or len(records) < self.max_events:
                 break
             first_page = False

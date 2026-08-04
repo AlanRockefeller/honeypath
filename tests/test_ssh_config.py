@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from .support import TempHomeCase
 
@@ -368,6 +370,73 @@ class IdentityFileNoneProbeTests(unittest.TestCase):
 
     def test_probe_with_a_missing_binary_is_false(self):
         self.assertFalse(ssh_canary.probe_identityfile_none("/nonexistent/ssh"))
+
+
+class ResolveSshBinaryTests(TempHomeCase):
+    def wrapper(self, directory: Path, name: str = "ssh") -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(f'#!/bin/sh\n{ssh_canary.WRAPPER_MARKER}\nexec ssh "$@"\n')
+        path.chmod(0o755)
+        return path
+
+    def resolve(self, path_dirs, **kwargs) -> str:
+        with mock.patch.dict(
+            os.environ, {"PATH": os.pathsep.join(str(d) for d in path_dirs)}
+        ):
+            return ssh_canary.resolve_ssh_binary(**kwargs)
+
+    def test_a_symlinked_wrapper_directory_is_still_excluded(self):
+        real = self.home / "bin"
+        self.wrapper(real)
+        link = self.home / "linked-bin"
+        link.symlink_to(real)
+        # The wrapper dir reached under another name must not come back in.
+        self.assertNotEqual(self.resolve([link], exclude=real), str(link / "ssh"))
+
+    def test_a_wrapper_elsewhere_on_path_is_never_returned(self):
+        stray = self.home / "somewhere"
+        self.wrapper(stray)
+        resolved = self.resolve([stray])
+        self.assertNotEqual(resolved, str(stray / "ssh"))
+        self.assertEqual(resolved, ssh_canary.SSH_BINARIES["ssh"])
+
+    def test_a_real_binary_on_path_is_returned(self):
+        directory = self.home / "opt"
+        directory.mkdir()
+        real = directory / "ssh"
+        real.write_text('#!/bin/sh\nexec /usr/bin/ssh "$@"\n')
+        real.chmod(0o755)
+        self.assertEqual(self.resolve([directory]), str(real))
+
+
+class StripRcBlockTests(unittest.TestCase):
+    def test_a_closed_block_is_removed(self):
+        text = (
+            "export EDITOR=vi\n"
+            f"{ssh_canary.RC_BEGIN}\n"
+            'export PATH="$HOME/bin:$PATH"\n'
+            f"{ssh_canary.RC_END}\n"
+            "alias ll='ls -l'\n"
+        )
+        cleaned = ssh_canary._strip_rc_block(text)
+        self.assertNotIn("$HOME/bin", cleaned)
+        self.assertIn("export EDITOR=vi", cleaned)
+        self.assertIn("alias ll='ls -l'", cleaned)
+
+    def test_an_unterminated_block_does_not_truncate_the_rest_of_the_file(self):
+        """A hand-edited end marker must not cost the user their rc file."""
+        text = (
+            "export EDITOR=vi\n"
+            f"{ssh_canary.RC_BEGIN}\n"
+            'export PATH="$HOME/bin:$PATH"\n'
+            "alias ll='ls -l'\n"
+        )
+        cleaned = ssh_canary._strip_rc_block(text)
+        self.assertNotIn(ssh_canary.RC_BEGIN, cleaned)
+        self.assertIn("export EDITOR=vi", cleaned)
+        self.assertIn("alias ll='ls -l'", cleaned)
+        self.assertIn("$HOME/bin", cleaned)
 
 
 if __name__ == "__main__":

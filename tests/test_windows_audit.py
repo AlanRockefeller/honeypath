@@ -470,7 +470,7 @@ class SetupGuardTests(TempHomeCase):
         ), mock.patch.object(
             windows_audit, "is_elevated", return_value=True
         ), mock.patch.object(
-            windows_audit, "audit_policy_state", return_value=("Disabled", None)
+            windows_audit, "audit_policy_state", return_value=("Disabled", False, None)
         ), mock.patch.object(
             windows_audit, "enable_audit_policy", return_value=(False, "denied")
         ), mock.patch.object(
@@ -498,7 +498,7 @@ class SetupGuardTests(TempHomeCase):
         ), mock.patch.object(
             windows_audit,
             "audit_policy_state",
-            side_effect=[("Disabled", None), ("Success", None)],
+            side_effect=[("Disabled", False, None), ("Success", True, None)],
         ), mock.patch.object(
             windows_audit, "enable_audit_policy", return_value=(True, "enabled")
         ), mock.patch.object(
@@ -606,7 +606,9 @@ class WindowsWatcherInstallRollbackTests(TempHomeCase):
         ), mock.patch.object(
             windows_audit, "is_elevated", return_value=True
         ), mock.patch.object(
-            windows_audit, "audit_policy_state", return_value=(None, "access denied")
+            windows_audit,
+            "audit_policy_state",
+            return_value=(None, None, "access denied"),
         ), mock.patch.object(
             windows_audit, "enable_audit_policy"
         ) as enable, mock.patch.object(

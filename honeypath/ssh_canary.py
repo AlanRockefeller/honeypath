@@ -95,15 +95,41 @@ def resolve_ssh_binary(name: str = "ssh", *, exclude: Path | None = None) -> str
     usually lives — on Nix, Homebrew or a locally built OpenSSH it is not there
     at all, and a wrapper pointing at a missing path breaks ssh outright.
     ``exclude`` keeps Honeypath's own wrapper directory out of the search, so a
-    wrapper can never end up calling itself.
+    wrapper can never end up calling itself.  The comparison is made on
+    resolved paths — ``~/bin``, ``bin`` and a symlink to the wrapper directory
+    all name the same place, and a plain string compare would let any of them
+    back into the search.  Whatever survives is checked once more for the
+    wrapper marker, since the same wrapper can also be installed somewhere
+    Honeypath was not told about.
     """
+    excluded = _resolved(exclude) if exclude is not None else None
     search = [
         directory
         for directory in os.environ.get("PATH", os.defpath).split(os.pathsep)
-        if directory and (exclude is None or Path(directory) != exclude)
+        if directory and (excluded is None or _resolved(Path(directory)) != excluded)
     ]
     found = shutil.which(name, path=os.pathsep.join(search))
+    if found and _is_wrapper(Path(found)):
+        found = None
     return found or SSH_BINARIES.get(name, SSH_BINARY)
+
+
+def _resolved(directory: Path) -> Path:
+    """``directory`` with symlinks and ``..`` removed; unresolvable is fine."""
+    try:
+        return directory.resolve()
+    except OSError:
+        return directory.absolute()
+
+
+def _is_wrapper(path: Path) -> bool:
+    """Whether ``path`` is one of Honeypath's own ssh/scp/sftp wrappers."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return WRAPPER_MARKER in fh.read(4096)
+    except OSError:
+        return False
+
 
 # Directives whose arguments are paths that must follow the relocation.
 REWRITE_DIRECTIVES = {
@@ -1372,17 +1398,27 @@ def remove_rc_blocks(
 def _strip_rc_block(text: str) -> str:
     out: list[str] = []
     seams: list[int] = []
+    held: list[str] = []
     skipping = False
     for line in text.splitlines(keepends=True):
         if line.strip() == RC_BEGIN:
             skipping = True
+            held = []
             continue
         if line.strip() == RC_END:
             skipping = False
+            held = []
             seams.append(len(out))
             continue
-        if not skipping:
+        if skipping:
+            held.append(line)
+        else:
             out.append(line)
+    # A BEGIN with no END marks a block whose end Honeypath cannot know, so
+    # everything after it is treated as the user's: only the marker line is
+    # dropped.  Deleting to end-of-file would truncate an rc file over a
+    # marker someone hand-edited.
+    out.extend(held)
     # Only the join the removed block left behind is tidied.  Collapsing every
     # run of blank lines in the file would reformat rc content the user wrote,
     # in a file Honeypath is supposed to be leaving as it found it.

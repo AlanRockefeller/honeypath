@@ -65,14 +65,6 @@ class InventoryTests(TempHomeCase):
         (self.ssh / "linked").symlink_to(outside)
         inventory = ssh_canary.inventory_ssh_dir(self.ssh)
         self.assertNotIn("linked", inventory.entries)
-        self.assertTrue(any("symlink" in r for r in inventory.refused))
-
-    def test_symlink_out_of_the_tree_is_never_followed(self):
-        outside = self.root / "secret.txt"
-        outside.write_text("elsewhere")
-        (self.ssh / "linked").symlink_to(outside)
-        inventory = ssh_canary.inventory_ssh_dir(self.ssh)
-        self.assertNotIn("linked", inventory.entries)
         self.assertTrue(any("linked" in r and "symlink" in r for r in inventory.refused))
 
     def test_symlink_inside_the_tree_is_also_refused(self):

@@ -92,6 +92,29 @@ class ValidateDestinationTests(TempHomeCase):
 
 
 class AtomicWriteTests(TempHomeCase):
+    def require_cas_replacement(self) -> None:
+        """Skip when the filesystem cannot do a compare-and-swap replacement.
+
+        Replacing an existing managed file needs O_TMPFILE *and*
+        ``renameat2(RENAME_EXCHANGE)``; creating a new one does not.  Probed
+        directly rather than through ``atomic_write`` so that a real
+        regression in the replacement path fails instead of quietly skipping.
+        """
+        if not safe_write.supports_unnamed_temporary():
+            self.skipTest("no O_TMPFILE here; managed replacement is unavailable")
+        first, second = self.home / ".cas-probe-a", self.home / ".cas-probe-b"
+        first.write_text("a")
+        second.write_text("b")
+        parent_fd = os.open(self.home, os.O_RDONLY)
+        try:
+            safe_write._renameat_exchange(parent_fd, first.name, second.name)
+        except safe_write.SafeWriteError as exc:
+            self.skipTest(f"no renameat2(RENAME_EXCHANGE) here: {exc}")
+        finally:
+            os.close(parent_fd)
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
+
     def test_writes_content_mode_and_leaves_no_temporary(self):
         path = self.home / ".netrc"
         safe_write.atomic_write(path, "body\n", mode=0o600, root=self.home)
@@ -142,6 +165,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertFalse(path.exists())
 
     def test_replaces_an_existing_file_atomically(self):
+        self.require_cas_replacement()
         path = self.home / ".netrc"
         path.write_text("old\n")
         original_inode = os.lstat(path).st_ino
@@ -165,6 +189,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertEqual(path.read_text(), "new\n")
 
     def test_a_rejected_replacement_puts_the_previous_inode_back(self):
+        self.require_cas_replacement()
         path = self.home / ".netrc"
         path.write_text("old\n")
         original_inode = os.lstat(path).st_ino
@@ -222,6 +247,7 @@ class AtomicWriteTests(TempHomeCase):
         self.assertTrue(issubclass(safe_write.RollbackError, safe_write.SafeWriteError))
 
     def test_a_rollback_that_cannot_complete_is_reported_as_fatal(self):
+        self.require_cas_replacement()
         path = self.home / ".netrc"
         path.write_text("old\n")
 

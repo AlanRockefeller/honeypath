@@ -151,6 +151,12 @@ class InotifyWatcher(Watcher):
 
     RESTART_BACKOFF = (1, 2, 5, 10, 30)
 
+    # A /proc walk is cheap once and expensive twenty times a second.  A sweep
+    # across every canary in a profile arrives as one burst of OPEN events, and
+    # the reader is the same process in all of them, so scanning for the first
+    # and declining for the rest of the burst costs almost nothing in answers.
+    ATTRIBUTION_MIN_INTERVAL = 0.5
+
     def __init__(self, paths, sink, stop_event, *, log=print, attribute=True):
         super().__init__("honeypath-inotify", sink, stop_event)
         self.paths = {str(p) for p in paths}
@@ -158,6 +164,7 @@ class InotifyWatcher(Watcher):
         self.log = log
         self.attribute = attribute
         self.proc: subprocess.Popen | None = None
+        self._last_attribution = 0.0
 
     @staticmethod
     def available() -> str | None:
@@ -265,9 +272,18 @@ class InotifyWatcher(Watcher):
         with any chance of catching the descriptor, and repeating the /proc
         walk for the ACCESS and CLOSE_NOWRITE that follow would trade real work
         for an answer that is at best identical and usually already stale.
+
+        Throttled on top of that, so a burst of OPENs across many canaries
+        cannot turn into one /proc walk each while the watcher thread is trying
+        to keep up with inotifywait.  A throttled event is still emitted and
+        still recorded; it simply carries no reader name.
         """
         if not self.attribute or "OPEN" not in names:
             return None
+        now = time.time()
+        if now - self._last_attribution < self.ATTRIBUTION_MIN_INTERVAL:
+            return None
+        self._last_attribution = now
         try:
             # Honeypath's own re-arming open would otherwise attribute every
             # read to Honeypath.

@@ -432,6 +432,15 @@ class CreateCanariesTests(TempHomeCase):
         assert row is not None
         self.assertIsNotNone(row.last_baseline_atime)
 
+    def test_a_failed_rollback_is_reported_and_exits_non_zero(self):
+        """A path left neither written nor undone must not read as "skipped"."""
+        fatal = safe_write.RollbackError("FATAL: rollback identity failed")
+        with mock.patch.object(
+            catalog, "create_canary_file", side_effect=fatal
+        ), self.quiet():
+            code = cli.cmd_create_canaries(self.make_context())
+        self.assertEqual(code, 3)
+
     def test_verification_read_is_included_in_recorded_atime_baseline(self):
         """A create followed immediately by watch must start quietly."""
         with self.quiet():

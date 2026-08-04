@@ -337,14 +337,14 @@ forever. The cause is ordinary machine activity — a backup pass, a scheduled
 anti-malware scan, the search indexer — and atime carries **no process
 attribution**, so Honeypath cannot tell any of them from a stealer.
 
-Since 0.2, atime reads of `platform=windows` canaries are therefore
+By default, atime reads of `platform=windows` canaries are therefore
 **advisory**: recorded as events, visible in `honeypath.py events` and the log
 file, never delivered. The event row says
 `suppressed: advisory detection method`.
 
 ```bash
 watch --windows-atime=log     # default: record, do not alert
-watch --windows-atime=alert   # pre-0.2 behaviour
+watch --windows-atime=alert   # deliver Windows atime hits as ordinary alerts
 watch --windows-atime=off     # do not even record the read
 ```
 
@@ -398,7 +398,7 @@ inotify reports that a canary was read and never says by whom. On an OPEN
 event Honeypath walks `/proc` looking for a descriptor pointing at the canary's
 inode, and attaches whatever it finds to the event and the alert body:
 
-```
+```text
 HONEYPATH high pgpass via inotify
 /home/alan/.pgpass
 psql pid=48213
@@ -420,7 +420,7 @@ that get swiped away. The **first** detection of a burst is delivered
 immediately; the rest are held until the burst goes quiet (default 30 s) and
 then summarised:
 
-```
+```text
 HONEYPATH sweep: 11 more canaries read (critical)
 /mnt/c/Users/alanr/.git-credentials
 /mnt/c/Users/alanr/.npmrc
@@ -464,7 +464,7 @@ canary's severity still labels the alert body, the log line and the
 This is the part people get wrong, so `doctor` reports it per filesystem rather
 than with one vague line:
 
-```
+```text
 Linux home (/home/alan, ext4):
   inotify access events: available
   atime: relatime (limited; re-arming enabled)

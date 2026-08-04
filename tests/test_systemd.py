@@ -365,9 +365,13 @@ class ServiceStateAccessTests(TempHomeCase):
         self.assertIsNone(cli.service_state_access(self.db, self.target))
 
     def test_a_database_owned_by_another_user_is_reported(self):
+        # The directory has to be usable by svc, or the check stops there and
+        # the database file is never reached.
+        os.chmod(self.db.path.parent, 0o777)
         os.chmod(self.db.path, 0o600)
         problem = cli.service_state_access(self.db, self.other_user())
         self.assertIsNotNone(problem)
+        self.assertIn(str(self.db.path), problem)
         self.assertIn("not writable by svc", problem)
 
     def test_an_unwritable_directory_is_reported(self):

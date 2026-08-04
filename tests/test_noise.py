@@ -637,7 +637,7 @@ class SuppressionKeepsTheRecordTests(TempHomeCase):
         self.assertIn("more canaries read", pushover.sent[1])
 
     def test_every_event_in_a_summary_gets_its_own_delivery_record(self):
-        monitor, pushover, path = self.build(
+        monitor, _, path = self.build(
             platform="linux", sweep_window=0.05, sweep_threshold=2, cooldown=0.0
         )
         others = [self.write(f"canary{i}", "secret\n") for i in range(3)]

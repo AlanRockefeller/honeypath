@@ -19,9 +19,12 @@ running as you, reading your secrets, needs no privilege at all.  Anything
 running as another user is invisible here — the Windows SACL watcher is what
 covers the equivalent gap on the Windows side.
 
-Nothing in here can block, follow a symlink into somewhere it should not go, or
-touch the canary's own atime: it stats descriptors under ``/proc``, never the
-canary path itself.
+Nothing in here follows a symlink into somewhere it should not go or touches
+the canary's own atime: it stats descriptors under ``/proc``, never the canary
+path itself.  It is not, however, guaranteed to return promptly — stat'ing a
+descriptor link resolves to whatever that descriptor points at, so a reader
+holding a file open on a hung filesystem (a dead NFS or 9p mount) can stall the
+scan and with it ``InotifyWatcher._handle_line``.
 """
 
 from __future__ import annotations

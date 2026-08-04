@@ -166,7 +166,10 @@ def build_context(args: argparse.Namespace, *, initialize_db: bool = True) -> Co
                 f"cannot open the Honeypath database at {db.path}: {exc}\n"
                 "Run under sudo, or pass --db <path> to use a different location."
             ) from exc
-        adopt_state_ownership(db, target)
+        # Best-effort by design, but a failed chown/chmod is exactly what makes
+        # the service unable to open its own database later, so say so now.
+        for problem in adopt_state_ownership(db, target):
+            print(f"  {problem}")
     return Context(
         args=args,
         target=target,
@@ -219,11 +222,20 @@ def service_state_access(db: Database, target: TargetUserContext) -> str | None:
     much as the file.  Returns ``None`` when both are usable.
     """
 
+    # The service user reaches group-readable state through *any* of its
+    # groups, not just its primary one: a state directory owned by a shared
+    # `honeypath` group is a perfectly ordinary setup, and reporting it as
+    # unusable would send the administrator chasing a problem that is not one.
+    try:
+        groups = set(os.getgrouplist(target.username, target.gid))
+    except (KeyError, OSError):
+        groups = {target.gid}
+
     def permitted(info: os.stat_result, bits: tuple[int, int, int]) -> bool:
         owner_bit, group_bit, other_bit = bits
         if info.st_uid == target.uid:
             return bool(info.st_mode & owner_bit)
-        if info.st_gid == target.gid:
+        if info.st_gid in groups:
             return bool(info.st_mode & group_bit)
         return bool(info.st_mode & other_bit)
 
@@ -639,8 +651,9 @@ def cmd_doctor(ctx: Context) -> int:
     print(
         f"inotifywait:         {inotify or 'NOT INSTALLED (apt install inotify-tools)'}"
     )
+    ssh_bin = ssh_canary.resolve_ssh_binary()
     print(
-        f"ssh binary:          {(ssh_bin := ssh_canary.resolve_ssh_binary())} "
+        f"ssh binary:          {ssh_bin} "
         f"({'present' if Path(ssh_bin).exists() else 'MISSING'})"
     )
     print(f"git:                 {shutil.which('git') or 'not found'}")
@@ -1028,6 +1041,10 @@ def cmd_create_canaries(ctx: Context) -> int:
     registered_count = 0
     skipped_count = len(planned_skips)
     problems: list[str] = []
+    # A failed rollback is not a skip: the path was left in a state Honeypath
+    # could neither complete nor undo, and that has to survive the summary and
+    # the exit status.
+    unrecoverable: list[str] = []
 
     for item in operations:
         best_effort = item.entry.platform == catalog_mod.PLATFORM_WINDOWS
@@ -1069,7 +1086,7 @@ def cmd_create_canaries(ctx: Context) -> int:
         except safe_write.RollbackError as exc:
             print(f"  {exc}")
             problems.append(f"{item.path}: {exc}")
-            skipped_count += 1
+            unrecoverable.append(str(item.path))
             continue
         except RegistrationRejected as exc:
             print(f"  {exc}: {item.path}")
@@ -1134,10 +1151,19 @@ def cmd_create_canaries(ctx: Context) -> int:
     print(f"  Refreshed: {refreshed_count}")
     print(f"  Registered watch-only: {registered_count}")
     print(f"  Skipped: {skipped_count}")
+    if unrecoverable:
+        print(f"  Left in an unknown state: {len(unrecoverable)}")
     if problems:
         heading("Ownership/permission warnings (expected on /mnt/c)")
         for problem in problems:
             print(f"  {problem}")
+    if unrecoverable:
+        heading("Needs operator attention")
+        print("  A write could not be completed and could not be undone.")
+        print("  Inspect these paths before relying on them:")
+        for path in unrecoverable:
+            print(f"    {path}")
+        return 3
     return 0
 
 
@@ -1573,7 +1599,7 @@ def cmd_setup(ctx: Context) -> int:
                 return code
             running_as_service = True
     else:
-        print("  systemd is not active in this WSL distribution.")
+        print("  systemd is not active or not available here.")
 
     if running_as_service:
         print("\nGuided setup complete; Honeypath is running as a service.")

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -17,9 +20,11 @@ from honeypath.target_user import TargetUserContext  # noqa: E402
 
 # A bare ``Pushover()`` reads /etc/honeypath, so on a machine where Honeypath is
 # actually configured, any test that forgets to inject a fake pushes a synthetic
-# alert to the operator's real phone.  Point the credentials somewhere that
-# cannot exist before a single test constructs one.
-_NO_CREDENTIALS = Path(tempfile.gettempdir()) / "honeypath-tests-no-credentials"
+# alert to the operator's real phone.  Point the credentials at a directory this
+# process owns: a fixed name under /tmp is one that any other user on the box
+# could have created first, complete with credentials of their choosing.
+_NO_CREDENTIALS = Path(tempfile.mkdtemp(prefix="honeypath-tests-no-credentials-"))
+atexit.register(shutil.rmtree, _NO_CREDENTIALS, True)
 _alerts.CONFIG_DIR = _NO_CREDENTIALS
 _alerts.TOKEN_FILE = _NO_CREDENTIALS / "pushover-token"
 _alerts.USER_FILE = _NO_CREDENTIALS / "pushover-user"
@@ -49,7 +54,10 @@ class TempHomeCase(unittest.TestCase):
         # writes land after the files it wrote them for are gone.
         try:
             self.db.close()
-        except Exception:
+        except sqlite3.Error:
+            # Anything that is not a database error here — a leaked writer
+            # connection, a thread that never stopped — is a test bug worth
+            # seeing rather than swallowing.
             pass
         self._tmp.cleanup()
 
