@@ -208,6 +208,25 @@ class DefaultProfileTests(unittest.TestCase):
         )
 
 
+class DeviceStabilityTests(unittest.TestCase):
+    def test_anonymous_device_filesystems_are_unstable(self):
+        for fstype in ("9p", "drvfs", "nfs", "nfs4", "cifs", "overlay", "fuse.sshfs"):
+            with self.subTest(fstype=fstype):
+                self.assertFalse(
+                    pd.has_stable_device_numbers(pd.MountInfo("/mnt/c", fstype, []))
+                )
+
+    def test_real_block_filesystems_are_stable(self):
+        for fstype in ("ext4", "xfs", "btrfs", "apfs"):
+            with self.subTest(fstype=fstype):
+                self.assertTrue(
+                    pd.has_stable_device_numbers(pd.MountInfo("/", fstype, []))
+                )
+
+    def test_unknown_mount_keeps_the_stricter_check(self):
+        self.assertTrue(pd.has_stable_device_numbers(None))
+
+
 class MountTests(unittest.TestCase):
     def test_mount_for_picks_the_most_specific(self):
         mounts = [

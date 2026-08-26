@@ -32,6 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path("/var/lib/honeypath/events.sqlite3")
+# The rows name every canary path -- the trap layout -- so the database is
+# held as tightly as the honeypath.log beside it.
+DB_MODE = 0o600
 SCHEMA_VERSION = 4
 
 MANAGED_BY = "honeypath"
@@ -201,6 +204,7 @@ class Database:
         # can hand it to the unprivileged user who has to write it afterwards.
         self.created_directories: list[Path] = []
         self.created_database = False
+        self._mode_tightened = False
 
     @classmethod
     def dry_run_snapshot(cls, path: Path | str) -> "Database":
@@ -260,9 +264,36 @@ class Database:
             conn.execute("PRAGMA query_only=ON")
         else:
             conn.execute("PRAGMA journal_mode=WAL")
+            self._tighten_mode()
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _tighten_mode(self) -> None:
+        """Keep the database as private as the log beside it.
+
+        SQLite creates the file through the process umask, which normally
+        lands on 0644.  The rows name every canary path, which is a map of the
+        trap layout -- the same reason honeypath.log is held at 0600.  The WAL
+        and shared-memory sidecars carry the same rows, so they get the same
+        treatment.  Best effort: a file owned by someone else is left alone
+        rather than taking the monitor down.
+        """
+        if self._mode_tightened:
+            return
+        self._mode_tightened = True
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(str(self._connection_path) + suffix)
+            try:
+                current = target.stat()
+            except OSError:
+                continue
+            if current.st_uid != os.getuid() or not current.st_mode & 0o077:
+                continue
+            try:
+                os.chmod(target, DB_MODE)
+            except OSError:
+                pass
 
     @contextmanager
     def connection(self):
@@ -634,6 +665,20 @@ class Database:
             conn.execute(
                 "UPDATE canaries SET last_baseline_atime=? WHERE path=?",
                 (atime_ns, path),
+            )
+
+    def update_canary_device(self, path: str, file_dev: int) -> None:
+        """Re-anchor a canary to a new st_dev, leaving its inode alone.
+
+        Only the watcher calls this, and only after confirming the inode is
+        unchanged on a filesystem whose device numbers move across a remount.
+        The inode is deliberately not writable here: that half of the identity
+        changing is a replacement, and must never be silently adopted.
+        """
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE canaries SET file_dev=? WHERE path=? AND active=1",
+                (file_dev, path),
             )
 
     def set_canaries_active(self, paths, active: int) -> int:
@@ -1099,6 +1144,14 @@ class WriterQueue(threading.Thread):
             lambda conn: conn.execute(
                 "UPDATE canaries SET last_baseline_atime=? WHERE path=?",
                 (atime_ns, path),
+            )
+        )
+
+    def update_canary_device(self, path: str, file_dev: int) -> None:
+        self.submit(
+            lambda conn: conn.execute(
+                "UPDATE canaries SET file_dev=? WHERE path=? AND active=1",
+                (file_dev, path),
             )
         )
 

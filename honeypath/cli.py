@@ -1714,7 +1714,7 @@ Description=Honeypath credential canary monitor
 Documentation=https://github.com/honeypath
 After=network-online.target
 Wants=network-online.target
-
+{mount_requirements}
 [Service]
 Type=simple
 # Honeypath runs UNPRIVILEGED, as the user whose canaries it watches.
@@ -1790,6 +1790,7 @@ def systemd_unit_text(ctx: Context) -> str:
             f"StateDirectoryMode=0700\n"
         ) + "".join(f"ReadWritePaths={grant}\n" for grant in grants)
     return SYSTEMD_TEMPLATE.format(
+        mount_requirements=_mount_requirement_lines(ctx),
         python=sys.executable,
         entry=entry,
         entry_dir=entry.parent,
@@ -1799,6 +1800,34 @@ def systemd_unit_text(ctx: Context) -> str:
         db_dir=db_dir,
         log_option=log_option,
         state=state,
+    )
+
+
+def _mount_requirement_lines(ctx: Context) -> str:
+    """Order the service after the filesystems its canaries actually live on.
+
+    A canary under /mnt/c is unreadable until WSL has mounted the Windows
+    drive.  Without this the service can win the race at boot and see a dozen
+    canaries "missing" at once.  RequiresMountsFor is path-based: a path that
+    is not on its own mount simply resolves to the root filesystem, so this is
+    safe to emit for every host.
+    """
+    try:
+        canaries = ctx.db.get_canaries(active_only=True)
+    except Exception:  # pragma: no cover - a unit is still worth writing
+        return ""
+    mounts = read_mounts()
+    mountpoints = set()
+    for canary in canaries:
+        mount = mount_for(Path(canary.path), mounts)
+        if mount and mount.mountpoint != "/":
+            mountpoints.add(mount.mountpoint)
+    if not mountpoints:
+        return ""
+    return (
+        "\n# Canaries live on these filesystems; do not start before they are\n"
+        "# mounted, or a boot-time race reports them all as missing.\n"
+        + "".join(f"RequiresMountsFor={mp}\n" for mp in sorted(mountpoints))
     )
 
 
