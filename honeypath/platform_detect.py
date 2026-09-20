@@ -320,7 +320,22 @@ def detect_windows_homes(
         return [], notes
 
     # A live profile has a registry hive; a stray D:\Users\name usually does not.
-    with_hive = [p for p in candidates if (p / "NTUSER.DAT").exists()]
+    # Windows may expose system-created profiles that the WSL user cannot stat.
+    # Treat those like other unusable candidates instead of aborting discovery.
+    with_hive: list[Path] = []
+    inaccessible: list[Path] = []
+    for candidate in candidates:
+        try:
+            if (candidate / "NTUSER.DAT").exists():
+                with_hive.append(candidate)
+        except OSError:
+            inaccessible.append(candidate)
+    if inaccessible:
+        notes.append(
+            "ignoring inaccessible Windows profile directories: "
+            + ", ".join(str(p) for p in inaccessible)
+        )
+        candidates = [p for p in candidates if p not in inaccessible]
     if with_hive and len(with_hive) < len(candidates):
         dropped = [p for p in candidates if p not in with_hive]
         notes.append(

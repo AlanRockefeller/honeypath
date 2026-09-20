@@ -120,6 +120,25 @@ class WindowsHomeDetectionTests(TempHomeCase):
         )
         self.assertTrue(any("NTUSER.DAT" in n for n in notes))
 
+    def test_inaccessible_registry_hive_is_ignored(self):
+        roots = self.make_drives({"c": ["alanr", "locked"]})
+        locked_hive = self.root / "mnt" / "c" / "Users" / "locked" / "NTUSER.DAT"
+        real_exists = Path.exists
+
+        def exists(path):
+            if path == locked_hive:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_exists(path)
+
+        with (
+            mock.patch.object(Path, "exists", autospec=True, side_effect=exists),
+            mock.patch.object(pd, "windows_username", return_value="alanr"),
+        ):
+            homes, notes = pd.detect_windows_homes(None, roots=roots)
+
+        self.assertEqual([p.name for p in homes], ["alanr"])
+        self.assertTrue(any("inaccessible" in n and "locked" in n for n in notes))
+
     def test_multiple_real_profiles_are_all_reported(self):
         roots = self.make_drives({"c": ["alanr"], "d": ["alanr"]})
         with mock.patch.object(pd, "windows_username", return_value="alanr"):
