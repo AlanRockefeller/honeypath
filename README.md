@@ -171,6 +171,7 @@ root's home.
 | Command | What it does |
 | --- | --- |
 | `setup` | Guided first run: alerts, safe-default canaries, WSL guidance, and optional service installation. |
+| `install-linux` | Native Linux one-command install: verify/start Audit, configure Pushover, create canaries, load persistent read rules, and enable monitoring. |
 | `doctor` | Environment report: OS, WSL, target user, homes, per-filesystem monitoring capability, Pushover status, DB writability, log-file status, SSH/wrapper state, Windows audit status. |
 | `plan` | Exactly what `create-canaries` would do, including every skip and its reason. |
 | `create-canaries` | Creates the canaries. Idempotent. **Never overwrites an existing path — there is no `--force`.** |
@@ -283,6 +284,35 @@ Properties worth knowing:
 ## Detection mechanics and their limits
 
 Honeypath uses up to three independent methods and merges their findings.
+
+### Linux one-command installation
+
+On a native Linux host with the `audit` and `inotify-tools` packages installed:
+
+```bash
+sudo python3 honeypath.py install-linux
+```
+
+If the checkout is on SSHFS or another FUSE mount that local root cannot read,
+use the bootstrap instead. It stages the runtime under
+`~/.local/share/honeypath` so the generated service has a durable local path:
+
+```bash
+./install-linux.sh
+```
+
+This verifies that `auditd.service` is enabled and active (and offers to start
+it if necessary), securely configures and tests Pushover when needed, creates
+the safe-default canaries without overwriting any existing credential path,
+writes exact-path read rules to `/etc/audit/rules.d/70-honeypath.rules`, and
+enables the unprivileged `honeypath.service` monitor. Audit provides the
+durable attributed record; inotify provides immediate Pushover delivery.
+
+Inspect attributed records with:
+
+```bash
+sudo ausearch -k honeypath-read -i
+```
 
 ### inotify (primary on Linux/WSL)
 

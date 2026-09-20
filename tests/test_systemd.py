@@ -18,7 +18,7 @@ from .support import TempHomeCase, namespace
 
 from honeypath import cli  # noqa: E402
 from honeypath.database import Database  # noqa: E402
-from honeypath.platform_detect import PlatformContext  # noqa: E402
+from honeypath.platform_detect import MountInfo, PlatformContext  # noqa: E402
 from honeypath.target_user import TargetUserContext  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +112,40 @@ class GeneratedUnitTests(TempHomeCase, UnitSafetyChecks):
             db=self.db,
             confirm=lambda _prompt: True,
         )
+
+    def _record_canary(self, path):
+        st = os.stat(path)
+        self.db.record_canary(
+            canary_id="k",
+            path=str(path),
+            kind="aws_credentials",
+            severity="critical",
+            profile="wsl-windows-supply-chain",
+            platform="windows",
+            intrusiveness="low",
+            baseline_atime=st.st_atime_ns,
+            file_dev=st.st_dev,
+            file_ino=st.st_ino,
+        )
+
+    def test_unit_waits_for_the_mounts_its_canaries_live_on(self):
+        """A canary under /mnt/c is unreadable until WSL mounts the drive."""
+        path = self.write("canary", "secret\n")
+        self._record_canary(path)
+        with mock.patch.object(
+            cli, "mount_for", return_value=MountInfo("/mnt/c", "9p", [])
+        ):
+            unit = cli.systemd_unit_text(self.make_context())
+        self.assertEqual(directives(unit)["RequiresMountsFor"], ["/mnt/c"])
+
+    def test_unit_omits_mount_ordering_for_root_only_canaries(self):
+        path = self.write("canary", "secret\n")
+        self._record_canary(path)
+        with mock.patch.object(
+            cli, "mount_for", return_value=MountInfo("/", "ext4", [])
+        ):
+            unit = cli.systemd_unit_text(self.make_context())
+        self.assertNotIn("RequiresMountsFor", unit)
 
     def test_generated_unit_is_safe(self):
         unit = cli.systemd_unit_text(self.make_context())

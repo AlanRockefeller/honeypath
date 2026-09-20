@@ -120,6 +120,25 @@ class WindowsHomeDetectionTests(TempHomeCase):
         )
         self.assertTrue(any("NTUSER.DAT" in n for n in notes))
 
+    def test_inaccessible_registry_hive_is_ignored(self):
+        roots = self.make_drives({"c": ["alanr", "locked"]})
+        locked_hive = self.root / "mnt" / "c" / "Users" / "locked" / "NTUSER.DAT"
+        real_exists = Path.exists
+
+        def exists(path):
+            if path == locked_hive:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_exists(path)
+
+        with (
+            mock.patch.object(Path, "exists", autospec=True, side_effect=exists),
+            mock.patch.object(pd, "windows_username", return_value="alanr"),
+        ):
+            homes, notes = pd.detect_windows_homes(None, roots=roots)
+
+        self.assertEqual([p.name for p in homes], ["alanr"])
+        self.assertTrue(any("inaccessible" in n and "locked" in n for n in notes))
+
     def test_multiple_real_profiles_are_all_reported(self):
         roots = self.make_drives({"c": ["alanr"], "d": ["alanr"]})
         with mock.patch.object(pd, "windows_username", return_value="alanr"):
@@ -206,6 +225,25 @@ class DefaultProfileTests(unittest.TestCase):
             pd.default_profiles_for(pd.OS_UNKNOWN, has_windows_home=False),
             ["linux-developer", "linux-supply-chain"],
         )
+
+
+class DeviceStabilityTests(unittest.TestCase):
+    def test_anonymous_device_filesystems_are_unstable(self):
+        for fstype in ("9p", "drvfs", "nfs", "nfs4", "cifs", "overlay", "fuse.sshfs"):
+            with self.subTest(fstype=fstype):
+                self.assertFalse(
+                    pd.has_stable_device_numbers(pd.MountInfo("/mnt/c", fstype, []))
+                )
+
+    def test_real_block_filesystems_are_stable(self):
+        for fstype in ("ext4", "xfs", "btrfs", "apfs"):
+            with self.subTest(fstype=fstype):
+                self.assertTrue(
+                    pd.has_stable_device_numbers(pd.MountInfo("/", fstype, []))
+                )
+
+    def test_unknown_mount_keeps_the_stricter_check(self):
+        self.assertTrue(pd.has_stable_device_numbers(None))
 
 
 class MountTests(unittest.TestCase):
