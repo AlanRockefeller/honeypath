@@ -49,6 +49,7 @@ from pathlib import Path
 
 from . import alerts as alerts_mod
 from . import eventlog as eventlog_mod
+from . import platform_detect
 from . import procscan
 from . import safe_write
 from .database import CanaryRow, Database, WriterQueue, utc_now
@@ -334,7 +335,11 @@ class AtimeWatcher(Watcher):
         self.identities: dict[str, tuple[int, int] | None] = {}
         self.rearmable: dict[str, bool] = {}
         self.read_mode: dict[str, str] = {}
+        self.dev_stable: dict[str, bool] = {}
+        self.mountpoints: dict[str, str] = {}
+        self.unmounted: set[str] = set()
         self.seen_missing: set[str] = set()
+        mounts = platform_detect.read_mounts()
         for canary in canaries:
             self.baselines[canary.path] = canary.last_baseline_atime or 0
             self.identities[canary.path] = (
@@ -347,6 +352,14 @@ class AtimeWatcher(Watcher):
             # every polling interval.  Windows atime is best-effort only; SACL
             # auditing is the reliable Windows-side mechanism.
             self.rearmable[canary.path] = canary.platform != "windows"
+            # Whether st_dev on this canary's filesystem survives a remount.
+            # It does not on WSL's /mnt/c, which is what turned every reboot
+            # into a dozen "REPLACED" alerts for files nothing had touched.
+            mount = platform_detect.mount_for(Path(canary.path), mounts)
+            self.dev_stable[canary.path] = platform_detect.has_stable_device_numbers(
+                mount
+            )
+            self.mountpoints[canary.path] = mount.mountpoint if mount else "/"
             self.read_mode[canary.path] = (
                 windows_atime if canary.platform == "windows" else WINDOWS_ATIME_ALERT
             )
@@ -357,6 +370,9 @@ class AtimeWatcher(Watcher):
             self.identities[path] = None
             self.rearmable[path] = True
             self.read_mode[path] = WINDOWS_ATIME_ALERT
+            mount = platform_detect.mount_for(Path(path))
+            self.dev_stable[path] = platform_detect.has_stable_device_numbers(mount)
+            self.mountpoints[path] = mount.mountpoint if mount else "/"
 
     @staticmethod
     def _root_for(path: str) -> Path:
@@ -379,13 +395,34 @@ class AtimeWatcher(Watcher):
 
     def _identity_matches(self, path: str, st: os.stat_result) -> bool:
         expected = self.identities.get(path)
-        actual = (st.st_dev, st.st_ino)
         if expected is None:
             # Legacy/unverified rows are not silently adopted at watch time.
             # Recreate or explicitly re-register them so the manifest contains
             # the inode identity observed through the anchored creator path.
             return False
-        return expected == actual
+        expected_dev, expected_ino = expected
+        if st.st_ino != expected_ino:
+            return False
+        if st.st_dev == expected_dev:
+            return True
+        # The inode is the one we recorded but the device number is not.  On a
+        # filesystem that takes its st_dev from the anonymous-device pool --
+        # 9p/drvfs under WSL, NFS, CIFS, FUSE -- that is precisely what a
+        # remount or a reboot looks like, and it says nothing about the file.
+        # Adopt the new device instead of reporting a replacement.
+        #
+        # Where st_dev *is* stable it stays part of the identity: there it is a
+        # real signal that something was mounted over the canary's directory.
+        if self.dev_stable.get(path, True):
+            return False
+        self.identities[path] = (st.st_dev, expected_ino)
+        self._persist_device(path, st.st_dev)
+        self.log(
+            f"[atime] {path}: device number changed "
+            f"{expected_dev} -> {st.st_dev} on a filesystem that reallocates "
+            "them; inode unchanged, so this is a remount, not a replacement"
+        )
+        return True
 
     def run(self) -> None:
         self.status = f"polling every {self.interval:.0f}s"
@@ -414,6 +451,26 @@ class AtimeWatcher(Watcher):
         if self.writer is not None:
             self.writer.update_baseline_atime(path, atime_ns)
 
+    def _mount_is_missing(self, path: str) -> bool:
+        """Is this canary's filesystem absent, rather than the file deleted?"""
+        mountpoint = self.mountpoints.get(path)
+        if not mountpoint or mountpoint == "/":
+            # Nothing to distinguish: a missing file on the root filesystem is
+            # a missing file.
+            return False
+        return not any(
+            mount.mountpoint == mountpoint for mount in platform_detect.read_mounts()
+        )
+
+    def _persist_device(self, path: str, file_dev: int) -> None:
+        """Record a device number the watcher has re-anchored to.
+
+        Without this the adoption is in-memory only and every restart
+        re-derives it -- and `doctor` keeps reporting the stale device.
+        """
+        if self.writer is not None:
+            self.writer.update_canary_device(path, file_dev)
+
     def poll_once(self) -> list[RawHit]:
         """One polling pass.  Returns the hits emitted (handy for tests)."""
         emitted: list[RawHit] = []
@@ -421,6 +478,20 @@ class AtimeWatcher(Watcher):
             try:
                 fd, st = self._inspect(path)
             except FileNotFoundError:
+                # A canary whose whole filesystem is not mounted has not been
+                # deleted -- most often this is a boot where the watcher won
+                # the race against the mount, and on WSL that would otherwise
+                # report every Windows-side canary as removed at once.
+                # Monitoring is degraded, which is a warning, not a detection.
+                if self._mount_is_missing(path):
+                    if path not in self.unmounted:
+                        self.unmounted.add(path)
+                        self.log(
+                            f"[atime] {path}: {self.mountpoints.get(path)} is not "
+                            "mounted; canary unwatchable until it returns "
+                            "(not reported as removed)"
+                        )
+                    continue
                 if path not in self.seen_missing:
                     self.seen_missing.add(path)
                     hit = RawHit(
@@ -446,6 +517,9 @@ class AtimeWatcher(Watcher):
                     self.emit(hit)
                     emitted.append(hit)
                 continue
+            if path in self.unmounted:
+                self.unmounted.discard(path)
+                self.log(f"[atime] {path}: filesystem is back, canary watched again")
             try:
                 identity_matches = self._identity_matches(path, st)
             finally:

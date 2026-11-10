@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from pathlib import Path
 from contextlib import closing
 import unittest
 
@@ -111,6 +112,23 @@ class SchemaTests(TempHomeCase):
             ok, detail = db.writable()
         self.assertTrue(ok)
         self.assertIn("would create", detail)
+
+
+class DatabaseModeTests(TempHomeCase):
+    def test_database_is_not_world_readable(self):
+        """The rows name every canary path, so the file is as private as the log."""
+        import os
+        import stat
+
+        # setUp already initialised it; force a read-write connection.
+        self.db.set_meta("probe", "1")
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(str(self.db.path) + suffix)
+            if not target.exists():
+                continue
+            with self.subTest(suffix=suffix or "db"):
+                mode = stat.S_IMODE(os.stat(target).st_mode)
+                self.assertEqual(mode & 0o077, 0, f"{target} is {oct(mode)}")
 
 
 class ManagedChangeTests(TempHomeCase):

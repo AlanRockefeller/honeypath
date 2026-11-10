@@ -191,6 +191,113 @@ class AtimeWatcherTests(TempHomeCase):
         )
         self.assertEqual(os.stat(path).st_mtime_ns, before_mtime)
 
+    # -- identity across a remount (§ device numbers) ----------------------
+
+    def test_device_number_change_on_9p_is_not_a_replacement(self):
+        """WSL's /mnt/c gets a fresh st_dev every boot; the inode does not.
+
+        Treating that as a replacement is what turned every reboot into a
+        dozen critical alerts for files nothing had touched.
+        """
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        st = os.stat(path)
+        # The mount came back with a different anonymous device number.
+        watcher.identities[str(path)] = (st.st_dev + 1, st.st_ino)
+        watcher.dev_stable[str(path)] = False
+
+        self.assertEqual(watcher.poll_once(), [])
+        # ... and the watcher re-anchored to the new device rather than
+        # re-reporting it on every pass.
+        self.assertEqual(watcher.identities[str(path)], (st.st_dev, st.st_ino))
+        self.assertIn("device number changed", self.logged())
+
+    def test_device_number_change_is_persisted(self):
+        path = self.write("canary", "secret\n")
+        st = os.stat(path)
+        self.db.record_canary(
+            canary_id="k",
+            path=str(path),
+            kind="ssh_private_key",
+            severity="critical",
+            profile="linux-developer",
+            platform="linux",
+            intrusiveness="high",
+            baseline_atime=st.st_atime_ns,
+            file_dev=st.st_dev + 1,
+            file_ino=st.st_ino,
+        )
+        watcher = self.make_watcher([path], writer=self.db)
+        watcher.identities[str(path)] = (st.st_dev + 1, st.st_ino)
+        watcher.dev_stable[str(path)] = False
+
+        watcher.poll_once()
+
+        row = self.db.get_canary_by_path(str(path))
+        self.assertEqual(row.file_dev, st.st_dev)
+        # The inode half is never rewritten by this path.
+        self.assertEqual(row.file_ino, st.st_ino)
+
+    def test_device_number_change_on_stable_filesystem_still_alerts(self):
+        """Where st_dev is meaningful it stays part of the identity."""
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        st = os.stat(path)
+        watcher.identities[str(path)] = (st.st_dev + 1, st.st_ino)
+        watcher.dev_stable[str(path)] = True
+
+        emitted = watcher.poll_once()
+        self.assertEqual(
+            [e.event_type for e in emitted], [monitor_mod.EVENT_REPLACED]
+        )
+
+    def test_inode_change_is_still_a_replacement_on_9p(self):
+        """Relaxing the device check must not relax the inode check."""
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        st = os.stat(path)
+        watcher.identities[str(path)] = (st.st_dev, st.st_ino + 1)
+        watcher.dev_stable[str(path)] = False
+
+        emitted = watcher.poll_once()
+        self.assertEqual(
+            [e.event_type for e in emitted], [monitor_mod.EVENT_REPLACED]
+        )
+
+    # -- a filesystem that is not mounted yet ------------------------------
+
+    def test_unmounted_filesystem_is_degraded_not_removed(self):
+        """Losing the race against a boot-time mount is not a deletion."""
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        watcher.mountpoints[str(path)] = "/definitely-not-a-mount-point"
+        path.unlink()
+
+        self.assertEqual(watcher.poll_once(), [])
+        self.assertIn("is not mounted", self.logged())
+
+    def test_missing_file_on_a_mounted_filesystem_still_alerts(self):
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        path.unlink()
+
+        emitted = watcher.poll_once()
+        self.assertEqual(
+            [e.event_type for e in emitted], [monitor_mod.EVENT_REMOVED]
+        )
+
+    def test_returning_filesystem_is_watched_again(self):
+        path = self.write("canary", "secret\n")
+        watcher = self.make_watcher([path])
+        watcher.mountpoints[str(path)] = "/definitely-not-a-mount-point"
+        contents = path.read_bytes()
+        path.unlink()
+        watcher.poll_once()
+
+        path.write_bytes(contents)
+        self.assertEqual(watcher.poll_once(), [])
+        self.assertIn("filesystem is back", self.logged())
+
     def test_deletion_then_recreation_rearms(self):
         path = self.write("canary", "secret\n")
         watcher = self.make_watcher([path])

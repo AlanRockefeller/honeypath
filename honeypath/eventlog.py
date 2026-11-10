@@ -273,6 +273,23 @@ class EventLog:
             os.write(self._fd, line)
         except OSError as exc:
             self._disable(f"write failed: {exc}")
+            return
+        # Flush the line to disk before returning.  O_APPEND makes the write
+        # atomic against other writers, but it does not make it durable: an
+        # unclean shutdown can leave the file extended with the data still in
+        # the page cache, which is how a crash turns the tail of this log into
+        # a block of NUL bytes -- and a NUL byte is also what makes `grep`
+        # treat the whole file as binary and silently print nothing at the
+        # moment an operator most needs to read it.
+        #
+        # The log carries a handful of lines per event, so the cost is noise
+        # next to the polling interval.  A failure here is not fatal and does
+        # not disable logging: the line is already written, and SQLite remains
+        # the authoritative store either way.
+        try:
+            os.fsync(self._fd)
+        except OSError:
+            pass
 
     # -- public API --------------------------------------------------------
 

@@ -320,7 +320,22 @@ def detect_windows_homes(
         return [], notes
 
     # A live profile has a registry hive; a stray D:\Users\name usually does not.
-    with_hive = [p for p in candidates if (p / "NTUSER.DAT").exists()]
+    # Windows may expose system-created profiles that the WSL user cannot stat.
+    # Treat those like other unusable candidates instead of aborting discovery.
+    with_hive: list[Path] = []
+    inaccessible: list[Path] = []
+    for candidate in candidates:
+        try:
+            if (candidate / "NTUSER.DAT").exists():
+                with_hive.append(candidate)
+        except OSError:
+            inaccessible.append(candidate)
+    if inaccessible:
+        notes.append(
+            "ignoring inaccessible Windows profile directories: "
+            + ", ".join(str(p) for p in inaccessible)
+        )
+        candidates = [p for p in candidates if p not in inaccessible]
     if with_hive and len(with_hive) < len(candidates):
         dropped = [p for p in candidates if p not in with_hive]
         notes.append(
@@ -407,6 +422,46 @@ def is_windows_filesystem(mount: MountInfo | None) -> bool:
     return bool(
         mount and mount.fstype in {"9p", "drvfs", "virtiofs", "cifs", "ntfs", "ntfs3"}
     )
+
+
+# Filesystems whose st_dev is handed out from the kernel's anonymous-device
+# pool at mount time instead of naming a stable block device.  The same file on
+# one of these legitimately reports a different st_dev after every remount --
+# and so after every reboot.  WSL's /mnt/c is the case that bites: 9p/drvfs
+# reports st_dev 70 one boot and 68 the next while the inode, derived from the
+# NTFS file ID, does not move at all.
+#
+# Inode numbers on these filesystems stay stable, so an identity check keeps
+# the inode and stops treating the device number as evidence of a swap.
+DEV_UNSTABLE_FSTYPES = {
+    "9p",
+    "drvfs",
+    "virtiofs",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "nfs",
+    "nfs4",
+    "fuse",
+    "fuseblk",
+    "sshfs",
+    "overlay",
+    "tmpfs",
+}
+
+
+def has_stable_device_numbers(mount: MountInfo | None) -> bool:
+    """Is ``st_dev`` on this mount the same after a remount or a reboot?
+
+    An unknown mount is reported stable: that keeps the stricter identity
+    check for anything this list does not recognise.
+    """
+    if mount is None:
+        return True
+    if mount.fstype in DEV_UNSTABLE_FSTYPES:
+        return False
+    # fuse.sshfs, fuse.rclone, fuse.gvfsd-fuse, ...
+    return not mount.fstype.startswith("fuse.")
 
 
 def inotifywait_path() -> str | None:

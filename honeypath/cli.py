@@ -17,12 +17,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import VERSION, alerts as alerts_mod
 from . import catalog as catalog_mod
 from . import eventlog
 from . import safe_write
-from . import ssh_canary, target_user as target_user_mod, windows_audit
+from . import linux_audit, ssh_canary, target_user as target_user_mod, windows_audit
 from .database import DEFAULT_DB_PATH, Database
 from . import monitor as monitor_mod
 from .monitor import (
@@ -37,6 +38,7 @@ from .monitor import (
     Monitor,
 )
 from .platform_detect import (
+    OS_LINUX,
     OS_MACOS,
     OS_WSL,
     detect_platform_context,
@@ -1614,6 +1616,98 @@ def cmd_setup(ctx: Context) -> int:
     return 0
 
 
+def cmd_install_linux(ctx: Context) -> int:
+    """Install the complete native-Linux canary and alerting workflow."""
+    heading("Honeypath Linux installation")
+    print(f"  Target user: {ctx.target.username}")
+    print(f"  Linux home:  {ctx.target.home}")
+    print("  Existing credential paths are always skipped and never overwritten.")
+
+    if ctx.platform.os_name != OS_LINUX:
+        print("install-linux is only for native Linux hosts.")
+        print("Use `setup` on WSL or macOS.")
+        return 1
+    if not ctx.dry_run and os.geteuid() != 0:
+        print("install-linux writes Audit and systemd configuration.")
+        print("Re-run this command with sudo.")
+        return 1
+    missing = [
+        name
+        for name in ("systemctl", "auditctl", "augenrules", "inotifywait")
+        if not shutil.which(name)
+    ]
+    if missing:
+        print("Missing required Linux monitoring tools: " + ", ".join(missing))
+        print("Install the audit and inotify-tools packages, then run this again.")
+        return 1
+
+    heading("Linux Audit")
+    active, enabled, detail = linux_audit.service_state()
+    print(f"  {detail}")
+    if not (active and enabled):
+        if not ctx.dry_run and not ctx.confirm(
+            "Enable and start auditd.service now?"
+        ):
+            print("Audit is required; installation stopped before creating canaries.")
+            return 1
+        ok, detail = linux_audit.enable_service(dry_run=ctx.dry_run)
+        print(f"  {detail}")
+        if not ok:
+            return 1
+
+    pushover = alerts_mod.Pushover()
+    if not pushover.configured():
+        heading("Pushover alerts")
+        if ctx.dry_run:
+            print("  [dry-run] would securely configure and test Pushover.")
+        else:
+            print("  Pushover is required by install-linux so a tripwire read reaches you.")
+            code = configure_alerts_interactive(ctx)
+            if code != 0:
+                print("Installation stopped before creating canaries.")
+                return code
+    else:
+        print("  Pushover alerts: configured")
+
+    heading("Canaries")
+    ctx.args.setup_compact = True
+    code = cmd_create_canaries(ctx)
+    if code != 0:
+        return code
+
+    heading("Persistent Audit rules")
+    canaries = ctx.db.get_canaries(active_only=True, platform="linux")
+    if ctx.dry_run:
+        # cmd_create_canaries deliberately writes no manifest rows in dry-run,
+        # so supply its planned paths to the equally non-mutating rule preview.
+        planned, _, _ = build_plan(ctx)
+        known = {canary.path for canary in canaries}
+        canaries += [
+            SimpleNamespace(path=str(item.path), active=1, platform="linux")
+            for item in planned
+            if item.entry.platform == "linux"
+            and item.action in {"create", "refresh", "watch-only"}
+            and str(item.path) not in known
+        ]
+    ok, detail = linux_audit.install_rules(canaries, dry_run=ctx.dry_run)
+    print(f"  {detail}")
+    if not ok:
+        return 1
+
+    heading("Continuous monitoring")
+    ctx.args.enable = True
+    code = cmd_install_systemd(ctx)
+    if code != 0:
+        return code
+    if ctx.dry_run:
+        print("\n[dry-run] Linux installation plan completed; nothing was changed.")
+    else:
+        print("\nLinux installation complete.")
+        print("  Audit records: sudo ausearch -k honeypath-read -i")
+        print("  Live service:  systemctl status honeypath.service")
+    return 0
+
+
 def _print_ssh_completion_steps(ctx: Context) -> None:
     """Close the loop on SSH Phase 1: what to test, and how to finish."""
     heading("Unfinished: the SSH canary is prepared, not active")
@@ -1714,7 +1808,7 @@ Description=Honeypath credential canary monitor
 Documentation=https://github.com/honeypath
 After=network-online.target
 Wants=network-online.target
-
+{mount_requirements}
 [Service]
 Type=simple
 # Honeypath runs UNPRIVILEGED, as the user whose canaries it watches.
@@ -1790,6 +1884,7 @@ def systemd_unit_text(ctx: Context) -> str:
             f"StateDirectoryMode=0700\n"
         ) + "".join(f"ReadWritePaths={grant}\n" for grant in grants)
     return SYSTEMD_TEMPLATE.format(
+        mount_requirements=_mount_requirement_lines(ctx),
         python=sys.executable,
         entry=entry,
         entry_dir=entry.parent,
@@ -1799,6 +1894,34 @@ def systemd_unit_text(ctx: Context) -> str:
         db_dir=db_dir,
         log_option=log_option,
         state=state,
+    )
+
+
+def _mount_requirement_lines(ctx: Context) -> str:
+    """Order the service after the filesystems its canaries actually live on.
+
+    A canary under /mnt/c is unreadable until WSL has mounted the Windows
+    drive.  Without this the service can win the race at boot and see a dozen
+    canaries "missing" at once.  RequiresMountsFor is path-based: a path that
+    is not on its own mount simply resolves to the root filesystem, so this is
+    safe to emit for every host.
+    """
+    try:
+        canaries = ctx.db.get_canaries(active_only=True)
+    except Exception:  # pragma: no cover - a unit is still worth writing
+        return ""
+    mounts = read_mounts()
+    mountpoints = set()
+    for canary in canaries:
+        mount = mount_for(Path(canary.path), mounts)
+        if mount and mount.mountpoint != "/":
+            mountpoints.add(mount.mountpoint)
+    if not mountpoints:
+        return ""
+    return (
+        "\n# Canaries live on these filesystems; do not start before they are\n"
+        "# mounted, or a boot-time race reports them all as missing.\n"
+        + "".join(f"RequiresMountsFor={mp}\n" for mp in sorted(mountpoints))
     )
 
 
@@ -2743,6 +2866,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_options(setup)
     setup.set_defaults(
         handler=cmd_setup,
+        activate=False,
+        allow_agent_forwarding=False,
+        force_managed_identities=False,
+        no_authorized_keys=False,
+        skip_git=False,
+    )
+
+    install_linux = sub.add_parser(
+        "install-linux",
+        help="install Linux Audit rules, canaries, Pushover, and monitoring",
+        description=(
+            "Install the complete native-Linux workflow: verify or start auditd, "
+            "configure Pushover, create safe-default canaries, load persistent "
+            "exact-path read rules, and enable the unprivileged monitor service."
+        ),
+    )
+    _add_common(install_linux, allow_force=False)
+    _add_profile_options(install_linux)
+    install_linux.set_defaults(
+        handler=cmd_install_linux,
         activate=False,
         allow_agent_forwarding=False,
         force_managed_identities=False,
